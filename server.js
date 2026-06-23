@@ -111,7 +111,8 @@ const HELP_TEXT = [
   "• 每天发送 /checkin 签到领 1 积分",
   "• 发送 /balance 查看余额和你的用户ID",
   `• 充值：1 元 = ${CREDITS_PER_YUAN} 积分，最低 ${MIN_RECHARGE_YUAN} 元起充，支持支付宝 / 微信`,
-  `• 联系客服充值：${CS_LINK}（把你的用户ID发给客服）`,
+  "• 联系客服充值（先用 /balance 拿到你的用户ID 报给客服）：",
+  CS_LINK,
   "",
   "💡 小贴士",
   "• 换衣时，服装图的角度/构图尽量和人物图接近，效果更好",
@@ -667,7 +668,10 @@ async function handleCommand(message) {
   }
 
   if (cmd === "/help") {
-    await tgSend(chatId, HELP_TEXT, { disable_web_page_preview: true });
+    await tgSend(chatId, HELP_TEXT, {
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: [[{ text: "👩‍💼 联系客服", url: CS_LINK }]] },
+    });
     return;
   }
 
