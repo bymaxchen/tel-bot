@@ -135,9 +135,13 @@ const K = {
   checkin: (id, date) => `checkin:${id}:${date}`,
   mode: (id) => `mode:${id}`,
   pending: (id) => `pending:${id}`,
+  busy: (id) => `busy:${id}`,
   task: (taskId) => `task:${taskId}`,
   done: (taskId) => `done:${taskId}`,
 };
+
+// 进行中任务的锁 TTL（秒）：防任务卡死后永久占用，超时自动释放
+const BUSY_TTL = 15 * 60;
 
 // 原子扣费：余额 >= cost 则扣减并返回新余额，否则返回 -1
 const SPEND_LUA = `
@@ -445,6 +449,7 @@ async function submitAndTrack(chatId, modeKey, nodeInfoList, cost) {
   const taskId = await rhRunTask(mode.webappId, nodeInfoList, webhookUrl());
   const info = { chatId, modeKey, cost, submittedAt: Date.now() };
   await redis.set(K.task(taskId), JSON.stringify(info), "EX", 7200); // 2h
+  await redis.set(K.busy(chatId), taskId, "EX", BUSY_TTL); // 上锁：该用户进行中
   console.log(`[${chatId}] 提交任务 taskId=${taskId} mode=${modeKey} cost=${cost}`);
   return taskId;
 }
@@ -523,6 +528,7 @@ async function finalizeTask(taskId, norm) {
     } catch (_) {}
   } finally {
     await redis.del(K.task(taskId));
+    await redis.del(K.busy(info.chatId)); // 解锁：该用户可发下一个任务
   }
 }
 
@@ -636,6 +642,13 @@ function insufficientText(cost, balance) {
 async function handlePhotoMessage(message) {
   const chatId = message.chat.id;
   const fileId = message.photo[message.photo.length - 1].file_id;
+
+  // 每用户同时只允许一个进行中任务
+  if (await redis.exists(K.busy(chatId))) {
+    await tgSend(chatId, "⏳ 你有一个任务正在处理中，完成后再发下一张哦～");
+    return;
+  }
+
   const modeKey = await getMode(chatId);
   const mode = MODES[modeKey];
 
