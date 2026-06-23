@@ -78,6 +78,50 @@ const MODES = {
 };
 const DEFAULT_MODE = "mode1";
 
+// 充值/客服
+const CS_LINK = "https://t.me/Joiuto";
+const CREDITS_PER_YUAN = 4; // 1 元 = 4 积分
+const MIN_RECHARGE_YUAN = 10; // 最低 10 元起充
+
+// /help 使用说明
+const HELP_TEXT = [
+  "🤖 使用帮助",
+  "",
+  "本机器人可对你发送的人物图片进行 AI 处理（脱衣 / 换衣）。",
+  "",
+  "📋 四种模式（括号内为消耗积分）",
+  `• /mode1 ${MODES.mode1.label}（${MODES.mode1.cost} 积分）`,
+  `• /mode2 ${MODES.mode2.label}（${MODES.mode2.cost} 积分）— 需要两张图`,
+  `• /mode3 ${MODES.mode3.label}（${MODES.mode3.cost} 积分）— 先扩成全身图再处理`,
+  `• /mode4 ${MODES.mode4.label}（${MODES.mode4.cost} 积分）— 需要两张图，先扩全身图`,
+  "",
+  "🔍 「直接」和「扩图」怎么选",
+  "• 直接：就按你发的原图处理，画面范围不变——不管全身、半身还是上半身，只想处理图里现有的部分，就用直接（更快、更省积分）。",
+  "• 扩图：只有当你发的是头像 / 半身 / 上半身，但希望得到全身效果时才用——AI 会先把缺的身体补成全身照，再处理。",
+  "👉 一句话：想要全身、但原图不全 → 用扩图；其它情况（包括只想处理半身）→ 用直接。",
+  "",
+  "🪄 怎么用",
+  "1️⃣ 发送 /mode 选择模式，或直接发 /mode1～/mode4",
+  "2️⃣ 直接发送图片：",
+  "　• 脱衣类（mode1/3）：发 1 张人物图即可",
+  "　• 换衣类（mode2/4）：先发【模特图】，再发【衣服图】👕",
+  "3️⃣ 等待约数分钟，结果会自动发回给你",
+  "",
+  "💎 积分",
+  "• 每天发送 /checkin 签到领 1 积分",
+  "• 发送 /balance 查看余额和你的用户ID",
+  `• 充值：1 元 = ${CREDITS_PER_YUAN} 积分，最低 ${MIN_RECHARGE_YUAN} 元起充，支持支付宝 / 微信`,
+  `• 联系客服充值：${CS_LINK}（把你的用户ID发给客服）`,
+  "",
+  "💡 小贴士",
+  "• 换衣时，服装图的角度/构图尽量和人物图接近，效果更好",
+  "• 同一时间只能处理一个任务，请等上一张完成后再发",
+  "• 图片过于暴露可能被系统拦截，换张图即可",
+  "",
+  "📖 命令一览",
+  "/start 开始 ｜ /mode 选模式 ｜ /checkin 签到 ｜ /balance 余额 ｜ /help 帮助",
+].join("\n");
+
 // 内容审核类失败：不退积分（用户图片/提示词本身问题）
 const NON_REFUNDABLE_CODES = new Set(["1501"]);
 
@@ -141,6 +185,7 @@ const K = {
   busy: (id) => `busy:${id}`,
   task: (taskId) => `task:${taskId}`,
   done: (taskId) => `done:${taskId}`,
+  rechargeLog: () => `recharge:log`,
 };
 
 // 进行中任务的锁 TTL（秒）：防任务卡死后永久占用，超时自动释放
@@ -307,12 +352,12 @@ function tgSend(chatId, text, extra = {}) {
   return telegramRequest("sendMessage", { chat_id: chatId, text, ...extra });
 }
 
-function tgSendDocument(chatId, fileBuffer, filename, caption) {
+function tgSendDocument(chatId, fileBuffer, filename, caption, contentType = "image/png") {
   return new Promise((resolve, reject) => {
     const form = new FormData();
     form.append("chat_id", String(chatId));
     if (caption) form.append("caption", caption);
-    form.append("document", fileBuffer, { filename, contentType: "image/png" });
+    form.append("document", fileBuffer, { filename, contentType });
     const options = {
       hostname: "api.telegram.org",
       path: `/bot${CONFIG.BOT_TOKEN}/sendDocument`,
@@ -615,9 +660,14 @@ async function handleCommand(message) {
   if (cmd === "/start") {
     await tgSend(
       chatId,
-      "👋 欢迎使用！\n\n每天发送 /checkin 签到可领 1 积分；\n积分消耗：脱衣/换衣 1 积分，扩图脱衣/扩图换衣 2 积分。\n\n发送 /balance 查看余额，/mode 选择模式，然后发送模特图即可开始。"
+      "👋 欢迎使用！\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始："
     );
     await sendModeMenu(chatId);
+    return;
+  }
+
+  if (cmd === "/help") {
+    await tgSend(chatId, HELP_TEXT, { disable_web_page_preview: true });
     return;
   }
 
@@ -646,7 +696,7 @@ async function handleCommand(message) {
     return;
   }
 
-  // 管理员充值：/grant <用户ID> <数量>
+  // 管理员充值：/grant <用户ID> <积分数量>
   if (cmd === "/grant") {
     if (!isAdmin(chatId)) {
       await tgSend(chatId, "⛔ 你没有权限使用该命令。");
@@ -655,14 +705,53 @@ async function handleCommand(message) {
     const targetId = args[0];
     const amount = Number(args[1]);
     if (!targetId || !Number.isInteger(amount) || amount <= 0) {
-      await tgSend(chatId, "用法：/grant <用户ID> <数量>，例如 /grant 123456789 10");
+      await tgSend(chatId, "用法：/grant <用户ID> <积分数量>，例如 /grant 123456789 40");
       return;
     }
     const balance = await redis.incrby(K.credits(targetId), amount);
-    await tgSend(chatId, `✅ 已给用户 ${targetId} 充值 ${amount} 积分，当前余额：${balance}`);
+    const yuan = +(amount / CREDITS_PER_YUAN).toFixed(2);
+    // 记录充值流水
+    const record = {
+      time: Date.now(),
+      targetId: String(targetId),
+      credits: amount,
+      yuan,
+      adminId: String(chatId),
+      balanceAfter: balance,
+    };
+    await redis.rpush(K.rechargeLog(), JSON.stringify(record));
+    await tgSend(chatId, `✅ 已给用户 ${targetId} 充值 ${amount} 积分（约 ¥${yuan}），当前余额：${balance}`);
     try {
       await tgSend(targetId, `🎉 客服为你充值了 ${amount} 积分，当前余额：${balance}`);
     } catch (_) {}
+    return;
+  }
+
+  // 管理员导出充值记录为表格文件：/records
+  if (cmd === "/records") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const items = await redis.lrange(K.rechargeLog(), 0, -1);
+    if (!items.length) {
+      await tgSend(chatId, "暂无充值记录。");
+      return;
+    }
+    const header = "时间,用户ID,充值积分,对应金额(元),操作管理员,充值后余额";
+    const rows = items.map((s) => {
+      const r = JSON.parse(s);
+      const t = new Date(r.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+      return [t, r.targetId, r.credits, r.yuan, r.adminId, r.balanceAfter].join(",");
+    });
+    const csv = "﻿" + [header, ...rows].join("\r\n"); // BOM 让 Excel 正确识别中文
+    await tgSendDocument(
+      chatId,
+      Buffer.from(csv, "utf8"),
+      `充值记录_${shanghaiDate()}.csv`,
+      `共 ${rows.length} 条充值记录`,
+      "text/csv"
+    );
     return;
   }
 

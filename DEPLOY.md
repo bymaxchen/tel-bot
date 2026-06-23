@@ -46,6 +46,7 @@ git commit -m "telegram rh bot - 生产版一期"
 对 BotFather 发 `/setcommands`，粘贴：
 ```
 start - 开始使用
+help - 使用帮助
 mode - 选择处理模式
 checkin - 每日签到领积分
 balance - 查看积分余额
