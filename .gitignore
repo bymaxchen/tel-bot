@@ -1,0 +1,16 @@
+# 依赖
+node_modules/
+
+# 环境变量 / 密钥（保留 .env.example 作模板）
+.env
+.env.*
+!.env.example
+keys.local.txt
+*.local.txt
+
+# 运行时临时文件
+tmp/
+
+# 日志
+*.log
+npm-debug.log*

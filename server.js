@@ -1,0 +1,790 @@
+// =============================================
+//  生产版：Telegram Bot + GPT Image + RunningHub
+//  一期：事件驱动（RunningHub webhook，不再轮询任务）+ 积分系统 + Redis 持久化
+//  Telegram 一期仍用 getUpdates（二期改 setWebhook）
+//
+//  需要 Node.js 18+
+//  依赖: npm install express ioredis form-data adm-zip
+//  环境变量见 .env.example
+//  运行: node server.js
+// =============================================
+
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const crypto = require("crypto");
+const express = require("express");
+const Redis = require("ioredis");
+const FormData = require("form-data");
+const AdmZip = require("adm-zip");
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// =============================================
+//  配置（密钥全部走环境变量）
+// =============================================
+const CONFIG = {
+  BOT_TOKEN: process.env.BOT_TOKEN,
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  RH_API_KEY: process.env.RH_API_KEY,
+  RH_API_BASE: process.env.RH_API_BASE || "https://www.runninghub.cn",
+  REDIS_URL: process.env.REDIS_URL || "redis://127.0.0.1:6379",
+
+  // 对外公网地址（用于拼 webhookUrl），如 https://xxx.up.railway.app
+  PUBLIC_URL: process.env.PUBLIC_URL,
+  // webhook 路径里的随机密钥，防伪造
+  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || "change-me",
+  PORT: Number(process.env.PORT) || 3000,
+
+  // 管理员 TG 用户 ID（逗号分隔），用于 /grant 充值
+  ADMIN_IDS: (process.env.ADMIN_IDS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+
+  // GPT 全身图提示词
+  GPT_MODEL: "gpt-image-2",
+  GPT_PROMPT:
+    "基于该背景扩展，生成全身照；人物不一定需要站着，也可以坐着，你寻一个最合适的姿势；不要修改人物的五官、长相、头部角度、脸部角度；服装是白色紧身T恤和蓝色紧身牛仔裤；如果她没戴帽子，不要给她戴帽子，不要给她增加莫名其妙的饰品和配件",
+};
+
+// 启动前校验必需的环境变量
+function assertConfig() {
+  const required = ["BOT_TOKEN", "OPENAI_API_KEY", "RH_API_KEY", "PUBLIC_URL"];
+  const missing = required.filter((k) => !CONFIG[k]);
+  if (missing.length) {
+    console.error("❌ 缺少环境变量：", missing.join(", "));
+    process.exit(1);
+  }
+  if (CONFIG.WEBHOOK_SECRET === "change-me") {
+    console.warn("⚠️ WEBHOOK_SECRET 仍为默认值，请在生产环境设置一个随机值");
+  }
+  if (!CONFIG.ADMIN_IDS.length) {
+    console.warn("⚠️ 未配置 ADMIN_IDS，/grant 充值命令将无人可用");
+  }
+}
+
+// =============================================
+//  模式定义（含积分消耗 cost）
+// =============================================
+const OLD_WEBAPP_ID = "2059460383823458305"; // 旧应用：单图（脱衣）
+const NEW_WEBAPP_ID = "2068341975195152385"; // 新应用：双图（换衣）
+
+const MODES = {
+  mode1: { label: "直接脱衣", useGpt: false, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 1, prompt: "让她全裸，其它保持不变" },
+  mode2: { label: "直接换衣", useGpt: false, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 1 },
+  mode3: { label: "扩图脱衣", useGpt: true, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 2, prompt: "让她全裸，其它保持不变" },
+  mode4: { label: "扩图换衣", useGpt: true, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 2 },
+};
+const DEFAULT_MODE = "mode1";
+
+// 内容审核类失败：不退积分（用户图片/提示词本身问题）
+const NON_REFUNDABLE_CODES = new Set(["1501"]);
+
+const TMP_DIR = path.join(__dirname, "tmp");
+
+// 旧应用（单图）节点
+function buildOldNodes(imageFileName, prompt) {
+  return [
+    { nodeId: "177", fieldName: "image", fieldValue: imageFileName, description: "Photo" },
+    { nodeId: "317", fieldName: "text", fieldValue: prompt, description: "Prompt" },
+  ];
+}
+// 新应用（双图）节点：模特图(107) + 衣服图(285)，无 prompt 节点
+function buildNewNodes(modelFileName, clothingFileName) {
+  return [
+    { nodeId: "107", fieldName: "image", fieldValue: modelFileName, description: "image" },
+    { nodeId: "285", fieldName: "image", fieldValue: clothingFileName, description: "image" },
+  ];
+}
+
+// =============================================
+//  Redis
+// =============================================
+const redis = new Redis(CONFIG.REDIS_URL, { maxRetriesPerRequest: null });
+redis.on("error", (e) => console.error("Redis 错误：", e.message));
+
+// Redis key
+const K = {
+  credits: (id) => `credits:${id}`,
+  checkin: (id, date) => `checkin:${id}:${date}`,
+  mode: (id) => `mode:${id}`,
+  pending: (id) => `pending:${id}`,
+  task: (taskId) => `task:${taskId}`,
+  done: (taskId) => `done:${taskId}`,
+};
+
+// 原子扣费：余额 >= cost 则扣减并返回新余额，否则返回 -1
+const SPEND_LUA = `
+local bal = tonumber(redis.call('GET', KEYS[1]) or '0')
+local cost = tonumber(ARGV[1])
+if bal >= cost then
+  return redis.call('DECRBY', KEYS[1], cost)
+else
+  return -1
+end`;
+
+async function getBalance(id) {
+  return Number(await redis.get(K.credits(id))) || 0;
+}
+// 返回新余额(>=0) 或 -1(余额不足)
+async function spend(id, cost) {
+  const res = await redis.eval(SPEND_LUA, 1, K.credits(id), cost);
+  return Number(res);
+}
+async function refund(id, cost) {
+  return Number(await redis.incrby(K.credits(id), cost));
+}
+
+// 上海时区的日期 YYYY-MM-DD
+function shanghaiDate() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai" });
+}
+// 每日签到：成功返回 {checked:true, balance}，今日已签到返回 {checked:false, balance}
+async function checkin(id) {
+  const date = shanghaiDate();
+  const ok = await redis.set(K.checkin(id, date), "1", "EX", 172800, "NX");
+  if (ok === "OK") {
+    const balance = await redis.incrby(K.credits(id), 1);
+    return { checked: true, balance };
+  }
+  return { checked: false, balance: await getBalance(id) };
+}
+
+async function getMode(id) {
+  const key = (await redis.get(K.mode(id))) || DEFAULT_MODE;
+  return MODES[key] ? key : DEFAULT_MODE;
+}
+async function setMode(id, modeKey) {
+  if (!MODES[modeKey]) return null;
+  await redis.set(K.mode(id), modeKey);
+  await redis.del(K.pending(id)); // 切换模式清空双图收集
+  return MODES[modeKey];
+}
+
+function isAdmin(id) {
+  return CONFIG.ADMIN_IDS.includes(String(id));
+}
+
+// =============================================
+//  通用下载
+// =============================================
+function downloadFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+    https
+      .get(url, (res) => {
+        if (res.statusCode !== 200) {
+          file.close();
+          fs.unlink(destPath, () => {});
+          return reject(new Error(`下载失败 HTTP ${res.statusCode}: ${url}`));
+        }
+        res.pipe(file);
+        file.on("finish", () => file.close(resolve));
+      })
+      .on("error", (err) => {
+        fs.unlink(destPath, () => {});
+        reject(err);
+      });
+  });
+}
+
+// =============================================
+//  Telegram
+// =============================================
+function telegramRequest(method, params) {
+  return new Promise((resolve, reject) => {
+    const postData = JSON.stringify(params);
+    const options = {
+      hostname: "api.telegram.org",
+      path: `/bot${CONFIG.BOT_TOKEN}/${method}`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(postData),
+      },
+    };
+    const clientTimeout = (Number(params?.timeout) || 0) * 1000 + 25000;
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`响应非 JSON (HTTP ${res.statusCode}): ${data.slice(0, 200)}`));
+        }
+      });
+    });
+    req.setTimeout(clientTimeout, () => req.destroy(new Error(`请求超时: ${method}`)));
+    req.on("error", reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+function tgSend(chatId, text, extra = {}) {
+  return telegramRequest("sendMessage", { chat_id: chatId, text, ...extra });
+}
+
+function tgSendDocument(chatId, fileBuffer, filename, caption) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (caption) form.append("caption", caption);
+    form.append("document", fileBuffer, { filename, contentType: "image/png" });
+    const options = {
+      hostname: "api.telegram.org",
+      path: `/bot${CONFIG.BOT_TOKEN}/sendDocument`,
+      method: "POST",
+      headers: form.getHeaders(),
+    };
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`sendDocument 响应非 JSON: ${data.slice(0, 200)}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    form.pipe(req);
+  });
+}
+
+function tgAnswerCallback(callbackQueryId, text) {
+  return telegramRequest("answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text: text || "",
+  });
+}
+
+// =============================================
+//  GPT Image：生成全身图，返回 Buffer
+// =============================================
+async function generateFullBody(imagePath) {
+  const form = new FormData();
+  form.append("model", CONFIG.GPT_MODEL);
+  form.append("image", fs.createReadStream(imagePath), {
+    filename: path.basename(imagePath),
+    contentType: "image/jpeg",
+  });
+  form.append("prompt", CONFIG.GPT_PROMPT);
+  form.append("n", "1");
+  form.append("size", "auto");
+  form.append("quality", "medium");
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: "api.openai.com",
+      path: "/v1/images/edits",
+      method: "POST",
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${CONFIG.OPENAI_API_KEY}` },
+    };
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.data && parsed.data[0]?.b64_json) {
+            resolve(Buffer.from(parsed.data[0].b64_json, "base64"));
+          } else {
+            reject(new Error(parsed.error?.message || JSON.stringify(parsed)));
+          }
+        } catch (e) {
+          reject(new Error("解析 GPT 响应失败: " + data.slice(0, 200)));
+        }
+      });
+    });
+    req.on("error", reject);
+    form.pipe(req);
+  });
+}
+
+// =============================================
+//  RunningHub
+// =============================================
+async function rhUploadImage(buffer, filename) {
+  const form = new FormData();
+  form.append("file", buffer, { filename, contentType: "image/png" });
+  const res = await fetch(`${CONFIG.RH_API_BASE}/openapi/v2/media/upload/binary`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${CONFIG.RH_API_KEY}`, ...form.getHeaders() },
+    body: form.getBuffer(),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`上传失败 HTTP ${res.status}: ${JSON.stringify(data)}`);
+  const fileName =
+    data?.data?.fileName ?? data?.data?.fileUrl ?? data?.fileName ?? data?.data;
+  if (!fileName) throw new Error("无法取出上传文件标识: " + JSON.stringify(data));
+  return fileName;
+}
+
+// 提交任务（带 webhookUrl），返回 taskId
+async function rhRunTask(webappId, nodeInfoList, webhookUrl) {
+  const res = await fetch(`${CONFIG.RH_API_BASE}/openapi/v2/run/ai-app/${webappId}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${CONFIG.RH_API_KEY}`,
+    },
+    body: JSON.stringify({
+      nodeInfoList,
+      instanceType: "default",
+      usePersonalQueue: "false",
+      webhookUrl,
+    }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`提交任务失败 HTTP ${res.status}: ${JSON.stringify(data)}`);
+  const taskId = data?.taskId ?? data?.data?.taskId;
+  if (!taskId) throw new Error("未取到 taskId: " + JSON.stringify(data));
+  return String(taskId);
+}
+
+// 兜底用：主动查询任务状态（reconciler）
+async function rhQueryTask(taskId) {
+  const res = await fetch(`${CONFIG.RH_API_BASE}/openapi/v2/query`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${CONFIG.RH_API_KEY}`,
+    },
+    body: JSON.stringify({ taskId }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`查询失败 HTTP ${res.status}: ${JSON.stringify(data)}`);
+  return data;
+}
+
+// 从结果里取出图片 Buffer（支持 zip 内 png，或直接 png 链接）
+async function fetchResultImage(results) {
+  const item =
+    (results || []).find((r) => r.outputType === "zip") ||
+    (results || []).find((r) => r.url) ||
+    (results || [])[0];
+  if (!item?.url) throw new Error("结果里没有可下载的 url");
+
+  const isZip = item.url.toLowerCase().includes(".zip");
+  const tmpPath = path.join(TMP_DIR, `result_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`);
+  await downloadFile(item.url, tmpPath);
+  try {
+    if (isZip) {
+      const zip = new AdmZip(tmpPath);
+      const png = zip
+        .getEntries()
+        .find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith(".png"));
+      if (!png) throw new Error("zip 内未找到 .png 文件");
+      return { buffer: png.getData(), name: path.basename(png.entryName) };
+    }
+    return { buffer: fs.readFileSync(tmpPath), name: path.basename(new URL(item.url).pathname) || "result.png" };
+  } finally {
+    if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+  }
+}
+
+// =============================================
+//  图片处理公共步骤
+// =============================================
+async function downloadTelegramPhoto(chatId, fileId) {
+  const localPath = path.join(TMP_DIR, `tmp_${chatId}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.jpg`);
+  const fileInfo = await telegramRequest("getFile", { file_id: fileId });
+  const filePath = fileInfo.result.file_path;
+  const url = `https://api.telegram.org/file/bot${CONFIG.BOT_TOKEN}/${filePath}`;
+  await downloadFile(url, localPath);
+  return localPath;
+}
+
+// 一张 TG 照片 → RunningHub 文件标识（useGpt 时静默经 GPT 生成全身图）
+async function prepareRhImage(chatId, fileId, useGpt) {
+  const localPath = await downloadTelegramPhoto(chatId, fileId);
+  try {
+    const buffer = useGpt ? await generateFullBody(localPath) : fs.readFileSync(localPath);
+    return await rhUploadImage(buffer, `input_${chatId}_${Date.now()}.png`);
+  } finally {
+    if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
+  }
+}
+
+function webhookUrl() {
+  return `${CONFIG.PUBLIC_URL.replace(/\/$/, "")}/rh-webhook/${CONFIG.WEBHOOK_SECRET}`;
+}
+
+// 提交任务 + 登记到 Redis（供 webhook 回调时反查）
+async function submitAndTrack(chatId, modeKey, nodeInfoList, cost) {
+  const mode = MODES[modeKey];
+  const taskId = await rhRunTask(mode.webappId, nodeInfoList, webhookUrl());
+  const info = { chatId, modeKey, cost, submittedAt: Date.now() };
+  await redis.set(K.task(taskId), JSON.stringify(info), "EX", 7200); // 2h
+  console.log(`[${chatId}] 提交任务 taskId=${taskId} mode=${modeKey} cost=${cost}`);
+  return taskId;
+}
+
+// =============================================
+//  完成 / 失败文案
+// =============================================
+function modeListText() {
+  return Object.entries(MODES)
+    .map(([k, m]) => `/${k} ${m.label}（${m.cost}积分）`)
+    .join("\n");
+}
+function buildCompletionCaption(mode, balance) {
+  const nextTip = mode.twoImages
+    ? "可以继续使用本模式：直接发送新的【模特图】即可开始下一次换衣～"
+    : "可以继续使用本模式：直接发送新图片即可继续处理～";
+  return [
+    "✅ 处理完成！",
+    "",
+    `🎛 当前模式：${mode.label}`,
+    `💎 剩余积分：${balance}`,
+    nextTip,
+    "",
+    "🔄 想换个玩法？随时切换模式：",
+    modeListText(),
+    "或发送 /mode 用按钮选择。",
+  ].join("\n");
+}
+
+// =============================================
+//  任务收尾（webhook 和 reconciler 共用，done 做一次性保护）
+// =============================================
+function normalizeResult(obj) {
+  const d = obj?.eventData ?? obj ?? {};
+  return {
+    status: String(d.status ?? "").toUpperCase(),
+    results: d.results,
+    errorCode: String(d.errorCode ?? ""),
+    errorMessage: d.errorMessage ?? "",
+  };
+}
+
+async function finalizeTask(taskId, norm) {
+  // 一次性保护：抢到 done 才处理，避免 webhook 重复 / 与 reconciler 撞车
+  const claimed = await redis.set(K.done(taskId), "1", "EX", 21600, "NX");
+  if (claimed !== "OK") return;
+
+  const raw = await redis.get(K.task(taskId));
+  if (!raw) {
+    console.warn(`finalizeTask: 找不到 task 映射 taskId=${taskId}（可能已过期）`);
+    return;
+  }
+  const info = JSON.parse(raw);
+  const mode = MODES[info.modeKey] || MODES[DEFAULT_MODE];
+
+  try {
+    if (norm.status === "SUCCESS") {
+      const { buffer, name } = await fetchResultImage(norm.results);
+      const balance = await getBalance(info.chatId);
+      await tgSendDocument(info.chatId, buffer, name || "result.png", buildCompletionCaption(mode, balance));
+    } else {
+      // 失败：内容审核类不退分，其它退分
+      let tip;
+      if (NON_REFUNDABLE_CODES.has(norm.errorCode)) {
+        tip = "❌ 内容审核未通过，请更换提示词或图片后重试（本次不退积分）。";
+      } else {
+        const balance = await refund(info.chatId, info.cost);
+        tip = `❌ 任务失败，已退还 ${info.cost} 积分（当前余额 ${balance}）。\n原因：${norm.errorMessage || "未知错误"}`;
+      }
+      await tgSend(info.chatId, tip);
+    }
+  } catch (err) {
+    console.error(`finalizeTask 处理失败 taskId=${taskId}:`, err);
+    try {
+      await tgSend(info.chatId, "❌ 结果处理出错，请稍后重试或联系客服。");
+    } catch (_) {}
+  } finally {
+    await redis.del(K.task(taskId));
+  }
+}
+
+// =============================================
+//  命令处理
+// =============================================
+function sendModeMenu(chatId) {
+  return telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: "请选择处理模式（括号内为消耗积分）：",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: `${MODES.mode1.label}(${MODES.mode1.cost})`, callback_data: "mode1" },
+          { text: `${MODES.mode2.label}(${MODES.mode2.cost})`, callback_data: "mode2" },
+        ],
+        [
+          { text: `${MODES.mode3.label}(${MODES.mode3.cost})`, callback_data: "mode3" },
+          { text: `${MODES.mode4.label}(${MODES.mode4.cost})`, callback_data: "mode4" },
+        ],
+      ],
+    },
+  });
+}
+
+async function handleCommand(message) {
+  const chatId = message.chat.id;
+  const cmd = message.text.trim().split(/\s+/)[0].replace(/@.*$/, "");
+  const args = message.text.trim().split(/\s+/).slice(1);
+
+  if (cmd === "/start") {
+    await tgSend(
+      chatId,
+      "👋 欢迎使用！\n\n每天发送 /checkin 签到可领 1 积分；\n积分消耗：脱衣/换衣 1 积分，扩图脱衣/扩图换衣 2 积分。\n\n发送 /balance 查看余额，/mode 选择模式，然后发送模特图即可开始。"
+    );
+    await sendModeMenu(chatId);
+    return;
+  }
+
+  if (cmd === "/mode") {
+    await sendModeMenu(chatId);
+    return;
+  }
+
+  if (cmd === "/checkin") {
+    const { checked, balance } = await checkin(chatId);
+    await tgSend(
+      chatId,
+      checked
+        ? `✅ 签到成功，+1 积分！当前余额：${balance}`
+        : `📅 今天已经签到过啦～当前余额：${balance}`
+    );
+    return;
+  }
+
+  if (cmd === "/balance") {
+    const balance = await getBalance(chatId);
+    await tgSend(
+      chatId,
+      `💎 当前积分：${balance}\n🆔 你的用户ID：${chatId}\n\n积分不足可发送 /checkin 每日签到，或把上面的用户ID发给客服充值。`
+    );
+    return;
+  }
+
+  // 管理员充值：/grant <用户ID> <数量>
+  if (cmd === "/grant") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const targetId = args[0];
+    const amount = Number(args[1]);
+    if (!targetId || !Number.isInteger(amount) || amount <= 0) {
+      await tgSend(chatId, "用法：/grant <用户ID> <数量>，例如 /grant 123456789 10");
+      return;
+    }
+    const balance = await redis.incrby(K.credits(targetId), amount);
+    await tgSend(chatId, `✅ 已给用户 ${targetId} 充值 ${amount} 积分，当前余额：${balance}`);
+    try {
+      await tgSend(targetId, `🎉 客服为你充值了 ${amount} 积分，当前余额：${balance}`);
+    } catch (_) {}
+    return;
+  }
+
+  // /mode1../mode4 切换
+  const m = cmd.match(/^\/(mode[1-4])$/);
+  if (m) {
+    const mode = await setMode(chatId, m[1]);
+    await tgSend(chatId, `✅ 已选择 ${mode.label}（消耗 ${mode.cost} 积分），发送一张模特图片即可开始。`);
+  }
+}
+
+async function handleCallbackQuery(cb) {
+  const chatId = cb.message.chat.id;
+  const mode = await setMode(chatId, cb.data);
+  if (!mode) {
+    await tgAnswerCallback(cb.id, "未知模式");
+    return;
+  }
+  await tgAnswerCallback(cb.id, `已选择 ${mode.label}`);
+  await tgSend(chatId, `✅ 已选择 ${mode.label}（消耗 ${mode.cost} 积分），发送一张模特图片即可开始。`);
+}
+
+// =============================================
+//  图片处理（按模式分流，含积分扣减）
+// =============================================
+function insufficientText(cost, balance) {
+  return `积分不足～本次需要 ${cost} 积分，当前余额 ${balance}。\n发送 /checkin 每日签到领 1 积分，或发送 /balance 拿到用户ID联系客服充值。`;
+}
+
+async function handlePhotoMessage(message) {
+  const chatId = message.chat.id;
+  const fileId = message.photo[message.photo.length - 1].file_id;
+  const modeKey = await getMode(chatId);
+  const mode = MODES[modeKey];
+
+  if (mode.twoImages) {
+    await handleTwoImageMode(chatId, fileId, modeKey, mode);
+  } else {
+    await handleSingleImageMode(chatId, fileId, modeKey, mode);
+  }
+}
+
+async function handleSingleImageMode(chatId, fileId, modeKey, mode) {
+  // 先原子扣费
+  const balance = await spend(chatId, mode.cost);
+  if (balance < 0) {
+    await tgSend(chatId, insufficientText(mode.cost, await getBalance(chatId)));
+    return;
+  }
+  try {
+    await tgSend(chatId, `⏳ 收到图片（${mode.label}），正在处理...`);
+    const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt);
+    await submitAndTrack(chatId, modeKey, buildOldNodes(imageFileName, mode.prompt), mode.cost);
+    await tgSend(chatId, "正在跑任务（约需数分钟）...");
+  } catch (err) {
+    await refund(chatId, mode.cost); // 提交前出错，退还积分
+    console.error(`[${chatId}] 处理失败：`, err);
+    await tgSend(chatId, `❌ 处理失败，已退还 ${mode.cost} 积分：${err.message}`);
+  }
+}
+
+async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
+  const pendingFileId = await redis.get(K.pending(chatId));
+
+  if (!pendingFileId) {
+    // 第一张模特图：先查余额（够才收），只记 fileId，立刻让发衣服图
+    const balance = await getBalance(chatId);
+    if (balance < mode.cost) {
+      await tgSend(chatId, insufficientText(mode.cost, balance));
+      return;
+    }
+    await redis.set(K.pending(chatId), fileId, "EX", 3600);
+    await tgSend(
+      chatId,
+      "✅ 模特图已收到，请再发送一张【衣服图】👕\n\n💡 小提示：服装图片的角度/构图最好和人物图保持接近，效果会更好～"
+    );
+    return;
+  }
+
+  // 第二张衣服图：原子扣费后处理
+  const balance = await spend(chatId, mode.cost);
+  if (balance < 0) {
+    await redis.del(K.pending(chatId));
+    await tgSend(chatId, insufficientText(mode.cost, await getBalance(chatId)));
+    return;
+  }
+  await redis.del(K.pending(chatId));
+  try {
+    await tgSend(chatId, "✅ 衣服图已收到，开始处理...");
+    const modelFileName = await prepareRhImage(chatId, pendingFileId, mode.useGpt);
+    const clothingFileName = await prepareRhImage(chatId, fileId, false);
+    await submitAndTrack(chatId, modeKey, buildNewNodes(modelFileName, clothingFileName), mode.cost);
+    await tgSend(chatId, "正在跑任务（约需数分钟）...");
+  } catch (err) {
+    await refund(chatId, mode.cost);
+    console.error(`[${chatId}] 处理失败：`, err);
+    await tgSend(chatId, `❌ 处理失败，已退还 ${mode.cost} 积分：${err.message}`);
+  }
+}
+
+// =============================================
+//  Telegram getUpdates 长轮询（一期）
+// =============================================
+let offset = 0;
+async function pollUpdates() {
+  try {
+    const res = await telegramRequest("getUpdates", { offset, timeout: 30 });
+    if (res.result?.length) {
+      for (const update of res.result) {
+        offset = update.update_id + 1;
+        if (update.callback_query) {
+          handleCallbackQuery(update.callback_query).catch((e) => console.error("按钮处理出错：", e));
+          continue;
+        }
+        const message = update.message;
+        if (message?.photo) {
+          handlePhotoMessage(message).catch((e) => console.error("图片处理出错：", e));
+        } else if (message?.text?.startsWith("/")) {
+          handleCommand(message).catch((e) => console.error("命令处理出错：", e));
+        }
+      }
+    }
+  } catch (err) {
+    console.error("轮询出错：", err.message);
+  }
+  setTimeout(pollUpdates, 1000);
+}
+
+// =============================================
+//  兜底对账：扫描超时未回调的任务，主动查一次
+// =============================================
+const RECONCILE_AFTER_MS = 6 * 60 * 1000; // 提交超过 6 分钟还没收尾就主动查
+async function reconcile() {
+  try {
+    let cursor = "0";
+    do {
+      const [next, keys] = await redis.scan(cursor, "MATCH", "task:*", "COUNT", 100);
+      cursor = next;
+      for (const key of keys) {
+        const raw = await redis.get(key);
+        if (!raw) continue;
+        const info = JSON.parse(raw);
+        if (Date.now() - info.submittedAt < RECONCILE_AFTER_MS) continue;
+        const taskId = key.slice("task:".length);
+        if (await redis.exists(K.done(taskId))) continue;
+        try {
+          const norm = normalizeResult(await rhQueryTask(taskId));
+          if (norm.status === "SUCCESS" || ["FAILED", "ERROR", "FAIL"].includes(norm.status)) {
+            console.log(`reconcile: 补收尾 taskId=${taskId} status=${norm.status}`);
+            await finalizeTask(taskId, norm);
+          }
+        } catch (e) {
+          console.error(`reconcile 查询失败 taskId=${taskId}:`, e.message);
+        }
+      }
+    } while (cursor !== "0");
+  } catch (e) {
+    console.error("reconcile 出错：", e.message);
+  }
+}
+
+// =============================================
+//  HTTP 服务（RunningHub webhook + 健康检查）
+// =============================================
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.post("/rh-webhook/:secret", async (req, res) => {
+  if (req.params.secret !== CONFIG.WEBHOOK_SECRET) {
+    return res.status(403).json({ ok: false });
+  }
+  // 立刻回 200，避免 RunningHub 因处理耗时而重试
+  res.json({ ok: true });
+
+  try {
+    const payload = req.body || {};
+    const taskId = String(payload?.eventData?.taskId ?? payload?.taskId ?? "");
+    if (!taskId) return console.warn("webhook 无 taskId：", JSON.stringify(payload).slice(0, 200));
+    const norm = normalizeResult(payload);
+    console.log(`webhook 收到 taskId=${taskId} status=${norm.status}`);
+    await finalizeTask(taskId, norm);
+  } catch (e) {
+    console.error("webhook 处理出错：", e);
+  }
+});
+
+// =============================================
+//  启动
+// =============================================
+process.on("unhandledRejection", (e) => console.error("未处理的 rejection：", e));
+process.on("uncaughtException", (e) => console.error("未捕获的异常：", e));
+
+async function main() {
+  assertConfig();
+  if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+
+  app.listen(CONFIG.PORT, () => {
+    console.log(`🌐 HTTP 服务已启动: 端口 ${CONFIG.PORT}`);
+    console.log(`   RunningHub webhook: ${webhookUrl()}`);
+  });
+
+  setInterval(reconcile, 60 * 1000); // 每分钟对账一次
+  console.log("🤖 Bot 启动，等待用户发图...");
+  pollUpdates();
+}
+
+main();
