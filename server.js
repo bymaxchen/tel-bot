@@ -101,8 +101,31 @@ function buildNewNodes(modelFileName, clothingFileName) {
 // =============================================
 //  Redis
 // =============================================
-const redis = new Redis(CONFIG.REDIS_URL, { maxRetriesPerRequest: null });
+// 自己解析连接串并显式传参，绕开 ioredis 的「URL vs 路径」识别问题；
+// 容错：去掉引号/空格，缺 scheme 时补 rediss://（Upstash 必须 TLS）。
+function buildRedis(raw) {
+  let s = String(raw || "").trim().replace(/^["']|["']$/g, "");
+  if (!/^rediss?:\/\//i.test(s)) {
+    s = "rediss://" + s.replace(/^\/+/, "");
+  }
+  const u = new URL(s);
+  const useTls = u.protocol === "rediss:";
+  console.log(
+    `Redis 目标: ${u.hostname}:${u.port || 6379} tls=${useTls ? "on" : "off"}`
+  );
+  return new Redis({
+    host: u.hostname,
+    port: Number(u.port) || 6379,
+    username: decodeURIComponent(u.username) || undefined,
+    password: decodeURIComponent(u.password) || undefined,
+    tls: useTls ? {} : undefined,
+    maxRetriesPerRequest: null,
+  });
+}
+
+const redis = buildRedis(CONFIG.REDIS_URL);
 redis.on("error", (e) => console.error("Redis 错误：", e.message));
+redis.on("connect", () => console.log("✅ Redis 已连接"));
 
 // Redis key
 const K = {
