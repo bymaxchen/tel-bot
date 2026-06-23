@@ -639,6 +639,15 @@ function insufficientText(cost, balance) {
   return `积分不足～本次需要 ${cost} 积分，当前余额 ${balance}。\n发送 /checkin 每日签到领 1 积分，或发送 /balance 拿到用户ID联系客服充值。`;
 }
 
+// 处理失败时给用户的友好提示（不暴露第三方/OpenAI 细节，完整错误只在控制台日志）
+function failureText(err, cost) {
+  const m = String(err?.message || "");
+  if (/safety|sexual|nsfw|rejected by the safety/i.test(m)) {
+    return `❌ 图片过于暴露，请换一张图片（已退还 ${cost} 积分）。`;
+  }
+  return `❌ 处理失败，已退还 ${cost} 积分，请稍后重试。`;
+}
+
 async function handlePhotoMessage(message) {
   const chatId = message.chat.id;
   const fileId = message.photo[message.photo.length - 1].file_id;
@@ -674,7 +683,7 @@ async function handleSingleImageMode(chatId, fileId, modeKey, mode) {
   } catch (err) {
     await refund(chatId, mode.cost); // 提交前出错，退还积分
     console.error(`[${chatId}] 处理失败：`, err);
-    await tgSend(chatId, `❌ 处理失败，已退还 ${mode.cost} 积分：${err.message}`);
+    await tgSend(chatId, failureText(err, mode.cost));
   }
 }
 
@@ -713,7 +722,7 @@ async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
   } catch (err) {
     await refund(chatId, mode.cost);
     console.error(`[${chatId}] 处理失败：`, err);
-    await tgSend(chatId, `❌ 处理失败，已退还 ${mode.cost} 积分：${err.message}`);
+    await tgSend(chatId, failureText(err, mode.cost));
   }
 }
 
