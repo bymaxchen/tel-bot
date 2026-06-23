@@ -143,6 +143,10 @@ const K = {
 // 进行中任务的锁 TTL（秒）：防任务卡死后永久占用，超时自动释放
 const BUSY_TTL = 15 * 60;
 
+// 内存索引：正在跑的任务 taskId -> submittedAt。
+// 对账只遍历它，空闲时不碰 Redis（省 Upstash 免费档命令额度）。重启时从 Redis 重建。
+const inflight = new Map();
+
 // 原子扣费：余额 >= cost 则扣减并返回新余额，否则返回 -1
 const SPEND_LUA = `
 local bal = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -450,6 +454,7 @@ async function submitAndTrack(chatId, modeKey, nodeInfoList, cost) {
   const info = { chatId, modeKey, cost, submittedAt: Date.now() };
   await redis.set(K.task(taskId), JSON.stringify(info), "EX", 7200); // 2h
   await redis.set(K.busy(chatId), taskId, "EX", BUSY_TTL); // 上锁：该用户进行中
+  inflight.set(taskId, info.submittedAt); // 登记到内存索引，供对账遍历
   console.log(`[${chatId}] 提交任务 taskId=${taskId} mode=${modeKey} cost=${cost}`);
   return taskId;
 }
@@ -529,6 +534,7 @@ async function finalizeTask(taskId, norm) {
   } finally {
     await redis.del(K.task(taskId));
     await redis.del(K.busy(info.chatId)); // 解锁：该用户可发下一个任务
+    inflight.delete(taskId);
   }
 }
 
@@ -758,7 +764,32 @@ async function pollUpdates() {
 //  兜底对账：扫描超时未回调的任务，主动查一次
 // =============================================
 const RECONCILE_AFTER_MS = 15 * 1000; // 提交超过 15 秒还没收尾就主动查（webhook 不通时的快速兜底）
+const TASK_MAX_AGE_MS = 20 * 60 * 1000; // 超过 20 分钟仍未终态则放弃（停止查询，busy 锁已自动过期）
+
 async function reconcile() {
+  const now = Date.now();
+  // 只遍历内存索引；为空时此函数不发起任何 Redis/网络请求
+  for (const [taskId, submittedAt] of [...inflight.entries()]) {
+    if (now - submittedAt < RECONCILE_AFTER_MS) continue;
+    if (now - submittedAt > TASK_MAX_AGE_MS) {
+      console.warn(`reconcile: 任务超时放弃查询 taskId=${taskId}`);
+      inflight.delete(taskId);
+      continue;
+    }
+    try {
+      const norm = normalizeResult(await rhQueryTask(taskId)); // 查 RunningHub，不消耗 Upstash
+      if (norm.status === "SUCCESS" || ["FAILED", "ERROR", "FAIL"].includes(norm.status)) {
+        console.log(`reconcile: 补收尾 taskId=${taskId} status=${norm.status}`);
+        await finalizeTask(taskId, norm);
+      }
+    } catch (e) {
+      console.error(`reconcile 查询失败 taskId=${taskId}:`, e.message);
+    }
+  }
+}
+
+// 启动时从 Redis 重建内存索引（一次性 SCAN，应对重启后仍在跑的任务）
+async function rebuildInflight() {
   try {
     let cursor = "0";
     do {
@@ -767,23 +798,12 @@ async function reconcile() {
       for (const key of keys) {
         const raw = await redis.get(key);
         if (!raw) continue;
-        const info = JSON.parse(raw);
-        if (Date.now() - info.submittedAt < RECONCILE_AFTER_MS) continue;
-        const taskId = key.slice("task:".length);
-        if (await redis.exists(K.done(taskId))) continue;
-        try {
-          const norm = normalizeResult(await rhQueryTask(taskId));
-          if (norm.status === "SUCCESS" || ["FAILED", "ERROR", "FAIL"].includes(norm.status)) {
-            console.log(`reconcile: 补收尾 taskId=${taskId} status=${norm.status}`);
-            await finalizeTask(taskId, norm);
-          }
-        } catch (e) {
-          console.error(`reconcile 查询失败 taskId=${taskId}:`, e.message);
-        }
+        inflight.set(key.slice("task:".length), JSON.parse(raw).submittedAt);
       }
     } while (cursor !== "0");
+    console.log(`恢复在跑任务 ${inflight.size} 个`);
   } catch (e) {
-    console.error("reconcile 出错：", e.message);
+    console.error("rebuildInflight 出错：", e.message);
   }
 }
 
@@ -830,7 +850,8 @@ async function main() {
     console.log(`   RunningHub webhook: ${webhookUrl()}`);
   });
 
-  setInterval(reconcile, 10 * 1000); // 每 10 秒对账一次（webhook 不通时的兜底）
+  await rebuildInflight(); // 重启后恢复在跑任务
+  setInterval(reconcile, 10 * 1000); // 每 10 秒对账一次（空闲时不消耗 Upstash）
   console.log("🤖 Bot 启动，等待用户发图...");
   pollUpdates();
 }
