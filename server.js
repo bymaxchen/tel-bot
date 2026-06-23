@@ -126,7 +126,10 @@ function buildRedis(raw) {
 }
 
 const redis = buildRedis(CONFIG.REDIS_URL);
-redis.on("error", (e) => console.error("Redis 错误：", e.message));
+redis.on("error", (e) => {
+  console.error("Redis 错误：", e.message);
+  notifyAdmin(`Redis 错误：${e.message}`);
+});
 redis.on("connect", () => console.log("✅ Redis 已连接"));
 
 // Redis key
@@ -146,6 +149,50 @@ const BUSY_TTL = 15 * 60;
 // 内存索引：正在跑的任务 taskId -> submittedAt。
 // 对账只遍历它，空闲时不碰 Redis（省 Upstash 免费档命令额度）。重启时从 Redis 重建。
 const inflight = new Map();
+
+// 全局并发限制器：控制同时进行的「GPT+上传+提交」数量，防止突发把 OpenAI/RunningHub 打爆
+function createLimiter(max) {
+  let active = 0;
+  const queue = [];
+  const tryNext = () => {
+    if (active >= max || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    Promise.resolve().then(fn).then(resolve, reject).finally(() => {
+      active--;
+      tryNext();
+    });
+  };
+  return {
+    run(fn) {
+      return new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        tryNext();
+      });
+    },
+    get atCapacity() {
+      return active >= max;
+    },
+    get queued() {
+      return queue.length;
+    },
+  };
+}
+const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY) || 5;
+const limiter = createLimiter(MAX_CONCURRENCY);
+
+// 告警：出严重错误时通知管理员（节流，每分钟最多一条，防刷屏）
+let lastAlertAt = 0;
+async function notifyAdmin(text) {
+  if (!CONFIG.ADMIN_IDS.length) return;
+  if (Date.now() - lastAlertAt < 60 * 1000) return;
+  lastAlertAt = Date.now();
+  for (const id of CONFIG.ADMIN_IDS) {
+    try {
+      await tgSend(id, `🚨 服务告警：\n${String(text).slice(0, 3000)}`);
+    } catch (_) {}
+  }
+}
 
 // 原子扣费：余额 >= cost 则扣减并返回新余额，否则返回 -1
 const SPEND_LUA = `
@@ -453,7 +500,6 @@ async function submitAndTrack(chatId, modeKey, nodeInfoList, cost) {
   const taskId = await rhRunTask(mode.webappId, nodeInfoList, webhookUrl());
   const info = { chatId, modeKey, cost, submittedAt: Date.now() };
   await redis.set(K.task(taskId), JSON.stringify(info), "EX", 7200); // 2h
-  await redis.set(K.busy(chatId), taskId, "EX", BUSY_TTL); // 上锁：该用户进行中
   inflight.set(taskId, info.submittedAt); // 登记到内存索引，供对账遍历
   console.log(`[${chatId}] 提交任务 taskId=${taskId} mode=${modeKey} cost=${cost}`);
   return taskId;
@@ -528,6 +574,7 @@ async function finalizeTask(taskId, norm) {
     }
   } catch (err) {
     console.error(`finalizeTask 处理失败 taskId=${taskId}:`, err);
+    notifyAdmin(`任务收尾失败 taskId=${taskId}：${err.message}`);
     try {
       await tgSend(info.chatId, "❌ 结果处理出错，请稍后重试或联系客服。");
     } catch (_) {}
@@ -657,13 +704,6 @@ function failureText(err, cost) {
 async function handlePhotoMessage(message) {
   const chatId = message.chat.id;
   const fileId = message.photo[message.photo.length - 1].file_id;
-
-  // 每用户同时只允许一个进行中任务
-  if (await redis.exists(K.busy(chatId))) {
-    await tgSend(chatId, "⏳ 你有一个任务正在处理中，完成后再发下一张哦～");
-    return;
-  }
-
   const modeKey = await getMode(chatId);
   const mode = MODES[modeKey];
 
@@ -674,30 +714,56 @@ async function handlePhotoMessage(message) {
   }
 }
 
+// 排队提示（并发已满时）
+async function maybeNotifyQueue(chatId) {
+  if (limiter.atCapacity) {
+    await tgSend(chatId, `🕐 当前任务较多，已排队（前面约 ${limiter.queued} 个），请稍候～`);
+  }
+}
+
 async function handleSingleImageMode(chatId, fileId, modeKey, mode) {
-  // 先原子扣费
+  // 原子上锁：同一用户同时仅一个进行中任务（避免排队期间重复下单/重复扣分）
+  if ((await redis.set(K.busy(chatId), "1", "EX", BUSY_TTL, "NX")) !== "OK") {
+    await tgSend(chatId, "⏳ 你有一个任务正在处理中，完成后再发下一张哦～");
+    return;
+  }
+  // 原子扣费
   const balance = await spend(chatId, mode.cost);
   if (balance < 0) {
+    await redis.del(K.busy(chatId));
     await tgSend(chatId, insufficientText(mode.cost, await getBalance(chatId)));
     return;
   }
+  let submitted = false;
   try {
     await tgSend(chatId, `⏳ 收到图片（${mode.label}），正在处理...`);
-    const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt);
-    await submitAndTrack(chatId, modeKey, buildOldNodes(imageFileName, mode.prompt), mode.cost);
-    await tgSend(chatId, "正在跑任务（约需数分钟）...");
+    await maybeNotifyQueue(chatId);
+    await limiter.run(async () => {
+      const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt);
+      await submitAndTrack(chatId, modeKey, buildOldNodes(imageFileName, mode.prompt), mode.cost);
+      submitted = true;
+    });
   } catch (err) {
-    await refund(chatId, mode.cost); // 提交前出错，退还积分
+    if (!submitted) {
+      await refund(chatId, mode.cost);
+      await redis.del(K.busy(chatId)); // 未提交则解锁
+    }
     console.error(`[${chatId}] 处理失败：`, err);
     await tgSend(chatId, failureText(err, mode.cost));
+    return;
   }
+  await tgSend(chatId, "正在跑任务（约需数分钟）...");
 }
 
 async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
   const pendingFileId = await redis.get(K.pending(chatId));
 
   if (!pendingFileId) {
-    // 第一张模特图：先查余额（够才收），只记 fileId，立刻让发衣服图
+    // 第一张模特图：若已有任务在跑则拒绝；否则查余额、只记 fileId、立刻让发衣服图
+    if (await redis.exists(K.busy(chatId))) {
+      await tgSend(chatId, "⏳ 你有一个任务正在处理中，完成后再发哦～");
+      return;
+    }
     const balance = await getBalance(chatId);
     if (balance < mode.cost) {
       await tgSend(chatId, insufficientText(mode.cost, balance));
@@ -711,25 +777,39 @@ async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
     return;
   }
 
-  // 第二张衣服图：原子扣费后处理
+  // 第二张衣服图：原子上锁 + 扣费后处理
+  if ((await redis.set(K.busy(chatId), "1", "EX", BUSY_TTL, "NX")) !== "OK") {
+    await tgSend(chatId, "⏳ 你有一个任务正在处理中，完成后再发哦～");
+    return;
+  }
   const balance = await spend(chatId, mode.cost);
   if (balance < 0) {
+    await redis.del(K.busy(chatId));
     await redis.del(K.pending(chatId));
     await tgSend(chatId, insufficientText(mode.cost, await getBalance(chatId)));
     return;
   }
   await redis.del(K.pending(chatId));
+  let submitted = false;
   try {
     await tgSend(chatId, "✅ 衣服图已收到，开始处理...");
-    const modelFileName = await prepareRhImage(chatId, pendingFileId, mode.useGpt);
-    const clothingFileName = await prepareRhImage(chatId, fileId, false);
-    await submitAndTrack(chatId, modeKey, buildNewNodes(modelFileName, clothingFileName), mode.cost);
-    await tgSend(chatId, "正在跑任务（约需数分钟）...");
+    await maybeNotifyQueue(chatId);
+    await limiter.run(async () => {
+      const modelFileName = await prepareRhImage(chatId, pendingFileId, mode.useGpt);
+      const clothingFileName = await prepareRhImage(chatId, fileId, false);
+      await submitAndTrack(chatId, modeKey, buildNewNodes(modelFileName, clothingFileName), mode.cost);
+      submitted = true;
+    });
   } catch (err) {
-    await refund(chatId, mode.cost);
+    if (!submitted) {
+      await refund(chatId, mode.cost);
+      await redis.del(K.busy(chatId));
+    }
     console.error(`[${chatId}] 处理失败：`, err);
     await tgSend(chatId, failureText(err, mode.cost));
+    return;
   }
+  await tgSend(chatId, "正在跑任务（约需数分钟）...");
 }
 
 // =============================================
@@ -838,8 +918,14 @@ app.post("/rh-webhook/:secret", async (req, res) => {
 // =============================================
 //  启动
 // =============================================
-process.on("unhandledRejection", (e) => console.error("未处理的 rejection：", e));
-process.on("uncaughtException", (e) => console.error("未捕获的异常：", e));
+process.on("unhandledRejection", (e) => {
+  console.error("未处理的 rejection：", e);
+  notifyAdmin(`未处理的 rejection：${e?.message || e}`);
+});
+process.on("uncaughtException", (e) => {
+  console.error("未捕获的异常：", e);
+  notifyAdmin(`未捕获的异常：${e?.message || e}`);
+});
 
 async function main() {
   assertConfig();
