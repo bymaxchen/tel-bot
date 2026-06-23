@@ -105,6 +105,8 @@ function buildNewNodes(modelFileName, clothingFileName) {
 // 容错：去掉引号/空格，缺 scheme 时补 rediss://（Upstash 必须 TLS）。
 function buildRedis(raw) {
   let s = String(raw || "").trim().replace(/^["']|["']$/g, "");
+  // 容错：值里误带了 KEY= 前缀（如 "REDIS_URL=rediss://...")，剥掉
+  s = s.replace(/^[A-Za-z_][A-Za-z0-9_]*=/, "").trim().replace(/^["']|["']$/g, "");
   if (!/^rediss?:\/\//i.test(s)) {
     s = "rediss://" + s.replace(/^\/+/, "");
   }
