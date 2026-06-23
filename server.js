@@ -757,7 +757,7 @@ async function pollUpdates() {
 // =============================================
 //  兜底对账：扫描超时未回调的任务，主动查一次
 // =============================================
-const RECONCILE_AFTER_MS = 6 * 60 * 1000; // 提交超过 6 分钟还没收尾就主动查
+const RECONCILE_AFTER_MS = 15 * 1000; // 提交超过 15 秒还没收尾就主动查（webhook 不通时的快速兜底）
 async function reconcile() {
   try {
     let cursor = "0";
@@ -796,6 +796,7 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/rh-webhook/:secret", async (req, res) => {
+  console.log("📩 webhook 被访问 /rh-webhook，secret 匹配:", req.params.secret === CONFIG.WEBHOOK_SECRET);
   if (req.params.secret !== CONFIG.WEBHOOK_SECRET) {
     return res.status(403).json({ ok: false });
   }
@@ -829,7 +830,7 @@ async function main() {
     console.log(`   RunningHub webhook: ${webhookUrl()}`);
   });
 
-  setInterval(reconcile, 60 * 1000); // 每分钟对账一次
+  setInterval(reconcile, 10 * 1000); // 每 10 秒对账一次（webhook 不通时的兜底）
   console.log("🤖 Bot 启动，等待用户发图...");
   pollUpdates();
 }
