@@ -71,9 +71,9 @@ const OLD_WEBAPP_ID = "2059460383823458305"; // 旧应用：单图（脱衣）
 const NEW_WEBAPP_ID = "2068341975195152385"; // 新应用：双图（换衣）
 
 const MODES = {
-  mode1: { label: "直接脱衣", useGpt: false, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 1, prompt: "让她全裸，其它保持不变" },
+  mode1: { label: "直接脱衣", useGpt: false, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 1, prompt: "全部去衣 保持人物比列不变，保持面部直接不变，中国女性" },
   mode2: { label: "直接换衣", useGpt: false, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 1 },
-  mode3: { label: "扩图脱衣", useGpt: true, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 2, prompt: "让她全裸，其它保持不变" },
+  mode3: { label: "扩图脱衣", useGpt: true, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 2, prompt: "全部去衣 保持人物比列不变，保持面部直接不变，中国女性" },
   mode4: { label: "扩图换衣", useGpt: true, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 2 },
 };
 const DEFAULT_MODE = "mode1";
@@ -187,7 +187,34 @@ const K = {
   task: (taskId) => `task:${taskId}`,
   done: (taskId) => `done:${taskId}`,
   rechargeLog: () => `recharge:log`,
+  statsDay: (date) => `stats:day:${date}`,
+  statsMode: (date) => `stats:mode:${date}`,
+  dau: (date) => `dau:${date}`,
 };
+
+// 统计聚合：HASH 计数 + DAU SET，按上海日期分桶，保留 90 天
+const STATS_TTL = 90 * 24 * 3600;
+const statsExpired = new Set(); // 进程内去重，避免每次写都 EXPIRE 浪费 Upstash 命令
+async function ensureStatsExpire(key) {
+  if (statsExpired.has(key)) return;
+  statsExpired.add(key);
+  try { await redis.expire(key, STATS_TTL); } catch (_) {}
+}
+async function bumpStat(field, n = 1) {
+  const key = K.statsDay(shanghaiDate());
+  await redis.hincrby(key, field, n);
+  ensureStatsExpire(key);
+}
+async function bumpMode(modeKey) {
+  const key = K.statsMode(shanghaiDate());
+  await redis.hincrby(key, modeKey, 1);
+  ensureStatsExpire(key);
+}
+async function markActive(uid) {
+  const key = K.dau(shanghaiDate());
+  await redis.sadd(key, String(uid));
+  ensureStatsExpire(key);
+}
 
 // 进行中任务的锁 TTL（秒）：防任务卡死后永久占用，超时自动释放
 const BUSY_TTL = 15 * 60;
@@ -272,6 +299,7 @@ async function checkin(id) {
   const ok = await redis.set(K.checkin(id, date), "1", "EX", 172800, "NX");
   if (ok === "OK") {
     const balance = await redis.incrby(K.credits(id), 1);
+    bumpStat("checkin").catch(() => {});
     return { checked: true, balance };
   }
   return { checked: false, balance: await getBalance(id) };
@@ -547,6 +575,9 @@ async function submitAndTrack(chatId, modeKey, nodeInfoList, cost) {
   const info = { chatId, modeKey, cost, submittedAt: Date.now() };
   await redis.set(K.task(taskId), JSON.stringify(info), "EX", 7200); // 2h
   inflight.set(taskId, info.submittedAt); // 登记到内存索引，供对账遍历
+  bumpStat("task_submit").catch(() => {});
+  bumpStat("credits_spent", cost).catch(() => {});
+  bumpMode(modeKey).catch(() => {});
   console.log(`[${chatId}] 提交任务 taskId=${taskId} mode=${modeKey} cost=${cost}`);
   return taskId;
 }
@@ -607,14 +638,18 @@ async function finalizeTask(taskId, norm) {
       const { buffer, name } = await fetchResultImage(norm.results);
       const balance = await getBalance(info.chatId);
       await tgSendDocument(info.chatId, buffer, name || "result.png", buildCompletionCaption(mode, balance));
+      bumpStat("task_success").catch(() => {});
     } else {
       // 失败：内容审核类不退分，其它退分
       let tip;
       if (NON_REFUNDABLE_CODES.has(norm.errorCode)) {
         tip = "❌ 内容审核未通过，请更换提示词或图片后重试（本次不退积分）。";
+        bumpStat("task_fail_nsfw").catch(() => {});
       } else {
         const balance = await refund(info.chatId, info.cost);
         tip = `❌ 任务失败，已退还 ${info.cost} 积分（当前余额 ${balance}）。\n原因：${norm.errorMessage || "未知错误"}`;
+        bumpStat("task_fail").catch(() => {});
+        bumpStat("credits_refund", info.cost).catch(() => {});
       }
       await tgSend(info.chatId, tip);
     }
@@ -657,6 +692,7 @@ async function handleCommand(message) {
   const chatId = message.chat.id;
   const cmd = message.text.trim().split(/\s+/)[0].replace(/@.*$/, "");
   const args = message.text.trim().split(/\s+/).slice(1);
+  markActive(chatId).catch(() => {});
 
   if (cmd === "/start") {
     await tgSend(
@@ -759,6 +795,47 @@ async function handleCommand(message) {
     return;
   }
 
+  // 管理员看使用统计：/stats [YYYY-MM-DD]，默认看今天
+  if (cmd === "/stats") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(args[0] || "") ? args[0] : shanghaiDate();
+    const [day, modeStats, dau] = await Promise.all([
+      redis.hgetall(K.statsDay(date)),
+      redis.hgetall(K.statsMode(date)),
+      redis.scard(K.dau(date)),
+    ]);
+    const n = (k) => Number(day[k] || 0);
+    const submit = n("task_submit");
+    const success = n("task_success");
+    const fail = n("task_fail");
+    const failNsfw = n("task_fail_nsfw");
+    const done = success + fail + failNsfw;
+    const rate = done ? ((success / done) * 100).toFixed(1) : "-";
+    const modeLine = Object.keys(MODES)
+      .map((k) => `${k}:${Number(modeStats[k] || 0)}`)
+      .join(" ");
+    await tgSend(
+      chatId,
+      [
+        `📊 使用统计 ${date}`,
+        ``,
+        `活跃用户(DAU)：${dau}`,
+        `任务提交：${submit}`,
+        `成功：${success}　失败：${fail}　审核未过：${failNsfw}`,
+        `成功率：${rate}${rate === "-" ? "" : "%"}（已收尾 ${done} 个）`,
+        `签到次数：${n("checkin")}`,
+        `积分消耗：${n("credits_spent")}　退还：${n("credits_refund")}`,
+        `各模式提交：${modeLine}`,
+        ``,
+        `提示：/stats 2026-06-23 可看历史，保留 90 天`,
+      ].join("\n")
+    );
+    return;
+  }
+
   // /mode1../mode4 切换
   const m = cmd.match(/^\/(mode[1-4])$/);
   if (m) {
@@ -799,6 +876,7 @@ async function handlePhotoMessage(message) {
   const fileId = message.photo[message.photo.length - 1].file_id;
   const modeKey = await getMode(chatId);
   const mode = MODES[modeKey];
+  markActive(chatId).catch(() => {});
 
   if (mode.twoImages) {
     await handleTwoImageMode(chatId, fileId, modeKey, mode);
