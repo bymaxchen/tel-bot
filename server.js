@@ -82,6 +82,7 @@ const DEFAULT_MODE = "mode1";
 const CS_LINK = "https://t.me/Joiuto";
 const CREDITS_PER_YUAN = 4; // 1 元 = 4 积分
 const MIN_RECHARGE_YUAN = 10; // 最低 10 元起充
+const NEW_USER_BONUS = 2; // 新用户首次进入赠送积分
 
 // /help 使用说明
 const HELP_TEXT = [
@@ -108,6 +109,7 @@ const HELP_TEXT = [
   "3️⃣ 等待约数分钟，结果会自动发回给你",
   "",
   "💎 积分",
+  `• 新用户首次进入赠送 ${NEW_USER_BONUS} 积分 🎁`,
   "• 每天发送 /checkin 签到领 1 积分",
   "• 发送 /balance 查看余额和你的用户ID",
   `• 充值：1 元 = ${CREDITS_PER_YUAN} 积分，最低 ${MIN_RECHARGE_YUAN} 元起充，支持支付宝 / 微信`,
@@ -190,7 +192,17 @@ const K = {
   statsDay: (date) => `stats:day:${date}`,
   statsMode: (date) => `stats:mode:${date}`,
   dau: (date) => `dau:${date}`,
+  userInit: (id) => `user:init:${id}`,
 };
+
+async function ensureNewUserBonus(id) {
+  // SET NX 永不过期，作为「该用户是否已发过新人礼」的幂等标记
+  const ok = await redis.set(K.userInit(id), "1", "NX");
+  if (ok !== "OK") return false;
+  await redis.incrby(K.credits(id), NEW_USER_BONUS);
+  bumpStat("new_user").catch(() => {});
+  return true;
+}
 
 // 统计聚合：HASH 计数 + DAU SET，按上海日期分桶，保留 90 天
 const STATS_TTL = 90 * 24 * 3600;
@@ -693,12 +705,13 @@ async function handleCommand(message) {
   const cmd = message.text.trim().split(/\s+/)[0].replace(/@.*$/, "");
   const args = message.text.trim().split(/\s+/).slice(1);
   markActive(chatId).catch(() => {});
+  const isNew = await ensureNewUserBonus(chatId).catch(() => false);
 
   if (cmd === "/start") {
-    await tgSend(
-      chatId,
-      "👋 欢迎使用！\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始："
-    );
+    const welcome = isNew
+      ? `👋 欢迎使用！已赠送 ${NEW_USER_BONUS} 积分新人礼 🎁\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始：`
+      : "👋 欢迎使用！\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始：";
+    await tgSend(chatId, welcome);
     await sendModeMenu(chatId);
     return;
   }
@@ -877,6 +890,9 @@ async function handlePhotoMessage(message) {
   const modeKey = await getMode(chatId);
   const mode = MODES[modeKey];
   markActive(chatId).catch(() => {});
+  if (await ensureNewUserBonus(chatId).catch(() => false)) {
+    await tgSend(chatId, `🎁 新人礼：已赠送 ${NEW_USER_BONUS} 积分，可直接开始体验～`);
+  }
 
   if (mode.twoImages) {
     await handleTwoImageMode(chatId, fileId, modeKey, mode);
