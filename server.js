@@ -45,7 +45,7 @@ const CONFIG = {
   // GPT 全身图提示词
   GPT_MODEL: "gpt-image-2",
   GPT_PROMPT:
-    "基于该背景扩展，生成全身照；人物不一定需要站着，也可以坐着，你寻一个最合适的姿势；不要修改人物的五官、长相、头部角度、脸部角度、脸部光影；服装是白色紧身T恤和紧身牛仔热裤；如果她没戴帽子，不要给她戴帽子，不要给她增加莫名其妙的饰品和配件",
+    "基于该背景扩展，生成全身照；人物不一定需要站着，也可以坐着，你寻一个最合适的姿势；不要修改人物的五官、长相、头部角度、脸部角度、脸部光影；服装是白色紧身T恤和紧身牛仔热裤；如果她没戴帽子，不要给她戴帽子",
 };
 
 // 启动前校验必需的环境变量
@@ -442,6 +442,7 @@ async function generateFullBody(imagePath) {
   form.append("n", "1");
   form.append("size", "auto");
   form.append("quality", "medium");
+  form.append("moderation", "low");
 
   return new Promise((resolve, reject) => {
     const options = {
