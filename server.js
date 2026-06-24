@@ -826,6 +826,8 @@ async function handleCommand(message) {
     const success = n("task_success");
     const fail = n("task_fail");
     const failNsfw = n("task_fail_nsfw");
+    const failPre = n("task_fail_presubmit");
+    const failPreNsfw = n("task_fail_presubmit_nsfw");
     const done = success + fail + failNsfw;
     const rate = done ? ((success / done) * 100).toFixed(1) : "-";
     const modeLine = Object.keys(MODES)
@@ -837,9 +839,11 @@ async function handleCommand(message) {
         `📊 使用统计 ${date}`,
         ``,
         `活跃用户(DAU)：${dau}`,
+        `新增用户：${n("new_user")}`,
         `任务提交：${submit}`,
         `成功：${success}　失败：${fail}　审核未过：${failNsfw}`,
-        `成功率：${rate}${rate === "-" ? "" : "%"}（已收尾 ${done} 个）`,
+        `提交前失败：${failPre}（其中疑似审核：${failPreNsfw}，已退分）`,
+        `成功率：${rate}${rate === "-" ? "" : "%"}（已收尾 ${done} 个，不含提交前失败）`,
         `签到次数：${n("checkin")}`,
         `积分消耗：${n("credits_spent")}　退还：${n("credits_refund")}`,
         `各模式提交：${modeLine}`,
@@ -935,12 +939,22 @@ async function handleSingleImageMode(chatId, fileId, modeKey, mode) {
     if (!submitted) {
       await refund(chatId, mode.cost);
       await redis.del(K.busy(chatId)); // 未提交则解锁
+      logPresubmitFail(err, mode.cost);
     }
     console.error(`[${chatId}] 处理失败：`, err);
     await tgSend(chatId, failureText(err, mode.cost));
     return;
   }
   await tgSend(chatId, "正在跑任务（约需数分钟）...");
+}
+
+// 提交 RunningHub 之前就失败（多为 GPT 扩图被审核拦截），单独计入统计
+function logPresubmitFail(err, cost) {
+  bumpStat("task_fail_presubmit").catch(() => {});
+  bumpStat("credits_refund", cost).catch(() => {});
+  if (/safety|sexual|nsfw|rejected by the safety/i.test(String(err?.message || ""))) {
+    bumpStat("task_fail_presubmit_nsfw").catch(() => {});
+  }
 }
 
 async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
@@ -992,6 +1006,7 @@ async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
     if (!submitted) {
       await refund(chatId, mode.cost);
       await redis.del(K.busy(chatId));
+      logPresubmitFail(err, mode.cost);
     }
     console.error(`[${chatId}] 处理失败：`, err);
     await tgSend(chatId, failureText(err, mode.cost));
