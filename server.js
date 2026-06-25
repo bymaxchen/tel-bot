@@ -111,6 +111,11 @@ const HELP_TEXT = [
   "　• 换衣类（mode2/4）：先发【模特图】，再发【衣服图】👕",
   "3️⃣ 等待约数分钟，结果会自动发回给你",
   "",
+  "✏️ 自定义提示词（仅 mode1 / mode3）",
+  "上传图片时可以在图片下方的「说明文字」里写补充提示词，会附加到默认提示词后，让效果更贴近你的需求。",
+  "例如：「一个美女，表情开心」",
+  "（不写就用默认提示词，照常处理）",
+  "",
   "💎 积分",
   `• 新用户首次进入赠送 ${NEW_USER_BONUS} 积分 🎁`,
   "• 每天发送 /checkin 签到领 1 积分",
@@ -986,6 +991,7 @@ function failureText(err, cost) {
 async function handlePhotoMessage(message) {
   const chatId = message.chat.id;
   const fileId = message.photo[message.photo.length - 1].file_id;
+  const userCaption = String(message.caption || "").trim(); // 用户随图发送的提示词
   const modeKey = await getMode(chatId);
   const mode = MODES[modeKey];
   markActive(chatId).catch(() => {});
@@ -996,7 +1002,7 @@ async function handlePhotoMessage(message) {
   if (mode.twoImages) {
     await handleTwoImageMode(chatId, fileId, modeKey, mode);
   } else {
-    await handleSingleImageMode(chatId, fileId, modeKey, mode);
+    await handleSingleImageMode(chatId, fileId, modeKey, mode, userCaption);
   }
 }
 
@@ -1007,7 +1013,7 @@ async function maybeNotifyQueue(chatId) {
   }
 }
 
-async function handleSingleImageMode(chatId, fileId, modeKey, mode) {
+async function handleSingleImageMode(chatId, fileId, modeKey, mode, userCaption = "") {
   // 原子上锁：同一用户同时仅一个进行中任务（避免排队期间重复下单/重复扣分）
   if ((await redis.set(K.busy(chatId), "1", "EX", BUSY_TTL, "NX")) !== "OK") {
     await tgSend(chatId, "⏳ 你有一个任务正在处理中，完成后再发下一张哦～");
@@ -1020,13 +1026,21 @@ async function handleSingleImageMode(chatId, fileId, modeKey, mode) {
     await tgSend(chatId, insufficientText(mode.cost, await getBalance(chatId)));
     return;
   }
+  // 合并用户 caption 到模式 prompt 后面（逗号分隔）；长度限制兜底，防滥用
+  const extra = userCaption.slice(0, 300).trim();
+  const finalPrompt = extra ? `${mode.prompt}，${extra}` : mode.prompt;
   let submitted = false;
   try {
-    await tgSend(chatId, `⏳ 收到图片（${mode.label}），正在处理...`);
+    await tgSend(
+      chatId,
+      extra
+        ? `⏳ 收到图片（${mode.label}），已附加你的提示词：${extra}\n正在处理...`
+        : `⏳ 收到图片（${mode.label}），正在处理...`
+    );
     await maybeNotifyQueue(chatId);
     await limiter.run(async () => {
       const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt, `mode=${modeKey}`);
-      await submitAndTrack(chatId, modeKey, buildOldNodes(imageFileName, mode.prompt), mode.cost);
+      await submitAndTrack(chatId, modeKey, buildOldNodes(imageFileName, finalPrompt), mode.cost);
       submitted = true;
     });
   } catch (err) {
