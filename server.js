@@ -776,6 +776,37 @@ async function handleCommand(message) {
     return;
   }
 
+  // 管理员查询某用户积分：/query <用户ID>
+  if (cmd === "/query") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const targetId = args[0];
+    if (!targetId || !/^\d+$/.test(targetId)) {
+      await tgSend(chatId, "用法：/query <用户ID>，例如 /query 123456789");
+      return;
+    }
+    const [balance, isNewUser, modeKey] = await Promise.all([
+      getBalance(targetId),
+      redis.exists(K.userInit(targetId)),
+      redis.get(K.mode(targetId)),
+    ]);
+    if (!isNewUser && balance === 0) {
+      await tgSend(chatId, `🔎 用户 ${targetId}\n无记录（未使用过本机器人）`);
+      return;
+    }
+    await tgSend(
+      chatId,
+      [
+        `🔎 用户 ${targetId}`,
+        `💎 当前积分：${balance}`,
+        `🎛 当前模式：${modeKey || DEFAULT_MODE}`,
+      ].join("\n")
+    );
+    return;
+  }
+
   // 管理员充值：/grant <用户ID> <积分数量>
   if (cmd === "/grant") {
     if (!isAdmin(chatId)) {
