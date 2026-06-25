@@ -74,9 +74,9 @@ const OLD_WEBAPP_ID = "2059460383823458305"; // 旧应用：单图（脱衣）
 const NEW_WEBAPP_ID = "2068341975195152385"; // 新应用：双图（换衣）
 
 const MODES = {
-  mode1: { label: "直接脱衣", useGpt: false, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 1, prompt: "全部去衣；不要修改人物的五官、长相、耳饰、项链、妆容、头部角度、发型、发色、脸部角度、脸部光影" },
+  mode1: { label: "直接脱衣", useGpt: false, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 1, prompt: "全部去衣 保持人物比列不变，保持面部直接不变，中国女性" },
   mode2: { label: "直接换衣", useGpt: false, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 1 },
-  mode3: { label: "扩图脱衣", useGpt: true, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 2, prompt: "全部去衣；不要修改人物的五官、长相、耳饰、项链、妆容、头部角度、发型、发色、脸部角度、脸部光影" },
+  mode3: { label: "扩图脱衣", useGpt: true, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 2, prompt: "全部去衣 保持人物比列不变，保持面部直接不变，中国女性" },
   mode4: { label: "扩图换衣", useGpt: true, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 2 },
 };
 const DEFAULT_MODE = "mode1";
