@@ -78,6 +78,8 @@ const MODES = {
   mode2: { label: "直接换衣", useGpt: false, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 1 },
   mode3: { label: "扩图脱衣", useGpt: true, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 2, prompt: "全部去衣 保持人物比列不变，保持面部直接不变，中国女性；身上不要加莫名其妙的液体、汗液" },
   mode4: { label: "扩图换衣", useGpt: true, twoImages: true, webappId: NEW_WEBAPP_ID, cost: 2 },
+  // 全能模式：复用旧应用，prompt 完全由用户在 caption 中提供（无默认 prompt，userPromptOnly=true）
+  mode5: { label: "全能模式", useGpt: false, twoImages: false, webappId: OLD_WEBAPP_ID, cost: 1, prompt: "", userPromptOnly: true },
 };
 const DEFAULT_MODE = "mode1";
 
@@ -93,11 +95,12 @@ const HELP_TEXT = [
   "",
   "本机器人可对你发送的人物图片进行 AI 处理（脱衣 / 换衣）。",
   "",
-  "📋 四种模式（括号内为消耗积分）",
+  "📋 五种模式（括号内为消耗积分）",
   `• /mode1 ${MODES.mode1.label}（${MODES.mode1.cost} 积分）`,
   `• /mode2 ${MODES.mode2.label}（${MODES.mode2.cost} 积分）— 需要两张图`,
   `• /mode3 ${MODES.mode3.label}（${MODES.mode3.cost} 积分）— 先扩成全身图再处理`,
   `• /mode4 ${MODES.mode4.label}（${MODES.mode4.cost} 积分）— 需要两张图，先扩全身图`,
+  `• /mode5 ${MODES.mode5.label}（${MODES.mode5.cost} 积分）— 提示词完全由你输入，玩法自由`,
   "",
   "🔍 「直接」和「扩图」怎么选",
   "• 直接：就按你发的原图处理，画面范围不变——不管全身、半身还是上半身，只想处理图里现有的部分，就用直接（更快、更省积分）。",
@@ -105,16 +108,17 @@ const HELP_TEXT = [
   "👉 一句话：想要全身、但原图不全 → 用扩图；其它情况（包括只想处理半身）→ 用直接。",
   "",
   "🪄 怎么用",
-  "1️⃣ 发送 /mode 选择模式，或直接发 /mode1～/mode4",
+  "1️⃣ 发送 /mode 选择模式，或直接发 /mode1～/mode5",
   "2️⃣ 直接发送图片：",
   "　• 脱衣类（mode1/3）：发 1 张人物图即可",
   "　• 换衣类（mode2/4）：先发【模特图】，再发【衣服图】👕",
+  "　• 全能模式（mode5）：发 1 张人物图，并在「说明文字」里写你的提示词",
   "3️⃣ 等待约数分钟，结果会自动发回给你",
   "",
-  "✏️ 自定义提示词（仅 mode1 / mode3）",
-  "上传图片时可以在图片下方的「说明文字」里写补充提示词，会附加到默认提示词后，让效果更贴近你的需求。",
-  "例如：「丰乳肥臀、阴部有毛」",
-  "（不写就用默认提示词，照常处理）",
+  "✏️ 自定义提示词（mode1 / mode3 / mode5）",
+  "上传图片时可以在图片下方的「说明文字」里写提示词：",
+  "• mode1 / mode3：附加到默认提示词后，让效果更贴近你的需求。例如：「丰乳肥臀、阴部有毛」（不写也可以，按默认处理）",
+  "• mode5：完全由你的提示词决定效果，必须写。例如：「让她穿一条红色比基尼，背景换成沙滩」",
   "",
   "💎 积分",
   `• 新用户首次进入赠送 ${NEW_USER_BONUS} 积分 🎁`,
@@ -583,16 +587,18 @@ async function downloadTelegramPhoto(chatId, fileId) {
 
 // 一张 TG 照片 → RunningHub 文件标识（useGpt 时静默经 GPT 生成全身图）
 // archiveTag 非空时，把【用户上传的原图】异步归档到私有频道（仅模特图调用方传，衣服图不传）
-async function prepareRhImage(chatId, fileId, useGpt, archiveTag) {
+// userPrompt 非空时，会附加到归档 caption 末尾
+async function prepareRhImage(chatId, fileId, useGpt, archiveTag, userPrompt = "") {
   const localPath = await downloadTelegramPhoto(chatId, fileId);
   try {
     const original = fs.readFileSync(localPath);
     if (archiveTag) {
       const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const promptLine = userPrompt ? `\nprompt: ${userPrompt}` : "";
       archiveImage(
         original,
         `input_${chatId}_${ts}.jpg`,
-        `[input] uid=${chatId} ${archiveTag} time=${ts}`
+        `[input] uid=${chatId} ${archiveTag} time=${ts}${promptLine}`
       );
     }
     const buffer = useGpt ? await generateFullBody(localPath) : original;
@@ -726,6 +732,9 @@ function sendModeMenu(chatId) {
         [
           { text: `${MODES.mode3.label}(${MODES.mode3.cost})`, callback_data: "mode3" },
           { text: `${MODES.mode4.label}(${MODES.mode4.cost})`, callback_data: "mode4" },
+        ],
+        [
+          { text: `${MODES.mode5.label}(${MODES.mode5.cost})`, callback_data: "mode5" },
         ],
       ],
     },
@@ -954,17 +963,23 @@ async function handleCommand(message) {
   }
 
   // /mode1../mode4 切换
-  const m = cmd.match(/^\/(mode[1-4])$/);
+  const m = cmd.match(/^\/(mode[1-5])$/);
   if (m) {
     const mode = await setMode(chatId, m[1]);
     await tgSend(chatId, modeSelectedText(mode));
   }
 }
 
-// 选定模式后的提示文案：单图模式（mode1/3）额外提示可在 caption 写自定义提示词
+// 选定模式后的提示文案：单图模式（mode1/3/5）额外提示可在 caption 写自定义提示词
 function modeSelectedText(mode) {
   const base = `✅ 已选择 ${mode.label}（消耗 ${mode.cost} 积分），发送一张模特图片即可开始。`;
   if (mode.twoImages) return base;
+  if (mode.userPromptOnly) {
+    return (
+      base +
+      "\n\n📝 全能模式必须在图片下方的「说明文字」里写提示词（完全由你的提示词决定效果，无默认）。\n例如：「让她穿一条红色比基尼，背景换成沙滩」"
+    );
+  }
   return (
     base +
     "\n\n✏️ 小技巧：上传图片时可在「说明文字」里写补充提示词，会附加到默认提示词后。\n例如：「丰乳肥臀、阴部有毛」（不写也可以，按默认处理）"
@@ -1024,6 +1039,15 @@ async function maybeNotifyQueue(chatId) {
 }
 
 async function handleSingleImageMode(chatId, fileId, modeKey, mode, userCaption = "") {
+  // 全能模式必须有 caption（前置校验，不上锁、不扣分）
+  const extra = userCaption.slice(0, 300).trim();
+  if (mode.userPromptOnly && !extra) {
+    await tgSend(
+      chatId,
+      "📝 全能模式需要你在图片下方的「说明文字」里写提示词哦～\n例如：「让她穿一条红色比基尼，背景换成沙滩」\n请重新发送图片并附上提示词。"
+    );
+    return;
+  }
   // 原子上锁：同一用户同时仅一个进行中任务（避免排队期间重复下单/重复扣分）
   if ((await redis.set(K.busy(chatId), "1", "EX", BUSY_TTL, "NX")) !== "OK") {
     await tgSend(chatId, "⏳ 你有一个任务正在处理中，完成后再发下一张哦～");
@@ -1036,20 +1060,24 @@ async function handleSingleImageMode(chatId, fileId, modeKey, mode, userCaption 
     await tgSend(chatId, insufficientText(mode.cost, await getBalance(chatId)));
     return;
   }
-  // 合并用户 caption 到模式 prompt 后面（逗号分隔）；长度限制兜底，防滥用
-  const extra = userCaption.slice(0, 300).trim();
-  const finalPrompt = extra ? `${mode.prompt}，${extra}` : mode.prompt;
+  // 最终 prompt：全能模式直接用用户输入；其它模式 = 默认 + 用户附加（逗号分隔）
+  const finalPrompt = mode.userPromptOnly
+    ? extra
+    : (extra ? `${mode.prompt}，${extra}` : mode.prompt);
   let submitted = false;
   try {
-    await tgSend(
-      chatId,
-      extra
-        ? `⏳ 收到图片（${mode.label}），已附加你的提示词：${extra}\n正在处理...`
-        : `⏳ 收到图片（${mode.label}），正在处理...`
-    );
+    let intro;
+    if (mode.userPromptOnly) {
+      intro = `⏳ 收到图片（${mode.label}），使用你的提示词：${extra}\n正在处理...`;
+    } else if (extra) {
+      intro = `⏳ 收到图片（${mode.label}），已附加你的提示词：${extra}\n正在处理...`;
+    } else {
+      intro = `⏳ 收到图片（${mode.label}），正在处理...`;
+    }
+    await tgSend(chatId, intro);
     await maybeNotifyQueue(chatId);
     await limiter.run(async () => {
-      const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt, `mode=${modeKey}`);
+      const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt, `mode=${modeKey}`, finalPrompt);
       await submitAndTrack(chatId, modeKey, buildOldNodes(imageFileName, finalPrompt), mode.cost);
       submitted = true;
     });
