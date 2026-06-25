@@ -957,8 +957,18 @@ async function handleCommand(message) {
   const m = cmd.match(/^\/(mode[1-4])$/);
   if (m) {
     const mode = await setMode(chatId, m[1]);
-    await tgSend(chatId, `✅ 已选择 ${mode.label}（消耗 ${mode.cost} 积分），发送一张模特图片即可开始。`);
+    await tgSend(chatId, modeSelectedText(mode));
   }
+}
+
+// 选定模式后的提示文案：单图模式（mode1/3）额外提示可在 caption 写自定义提示词
+function modeSelectedText(mode) {
+  const base = `✅ 已选择 ${mode.label}（消耗 ${mode.cost} 积分），发送一张模特图片即可开始。`;
+  if (mode.twoImages) return base;
+  return (
+    base +
+    "\n\n✏️ 小技巧：上传图片时可在「说明文字」里写补充提示词，会附加到默认提示词后。\n例如：「一个美女，表情开心」（不写也可以，按默认处理）"
+  );
 }
 
 async function handleCallbackQuery(cb) {
@@ -969,7 +979,7 @@ async function handleCallbackQuery(cb) {
     return;
   }
   await tgAnswerCallback(cb.id, `已选择 ${mode.label}`);
-  await tgSend(chatId, `✅ 已选择 ${mode.label}（消耗 ${mode.cost} 积分），发送一张模特图片即可开始。`);
+  await tgSend(chatId, modeSelectedText(mode));
 }
 
 // =============================================
