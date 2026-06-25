@@ -42,6 +42,9 @@ const CONFIG = {
     .map((s) => s.trim())
     .filter(Boolean),
 
+  // 归档频道（可选）：配置后用户模特图 + 结果图都会发一份到这个私有频道
+  ARCHIVE_CHANNEL_ID: process.env.ARCHIVE_CHANNEL_ID || "",
+
   // GPT 全身图提示词
   GPT_MODEL: "gpt-image-2",
   GPT_PROMPT:
@@ -428,6 +431,13 @@ function tgAnswerCallback(callbackQueryId, text) {
   });
 }
 
+// 归档到私有频道（fire-and-forget；失败只打日志，不影响主流程）
+function archiveImage(buffer, filename, caption, contentType = "image/jpeg") {
+  if (!CONFIG.ARCHIVE_CHANNEL_ID) return Promise.resolve();
+  return tgSendDocument(CONFIG.ARCHIVE_CHANNEL_ID, buffer, filename, caption, contentType)
+    .catch((e) => console.error("归档失败：", e.message));
+}
+
 // =============================================
 //  GPT Image：生成全身图，返回 Buffer
 // =============================================
@@ -567,10 +577,20 @@ async function downloadTelegramPhoto(chatId, fileId) {
 }
 
 // 一张 TG 照片 → RunningHub 文件标识（useGpt 时静默经 GPT 生成全身图）
-async function prepareRhImage(chatId, fileId, useGpt) {
+// archiveTag 非空时，把【用户上传的原图】异步归档到私有频道（仅模特图调用方传，衣服图不传）
+async function prepareRhImage(chatId, fileId, useGpt, archiveTag) {
   const localPath = await downloadTelegramPhoto(chatId, fileId);
   try {
-    const buffer = useGpt ? await generateFullBody(localPath) : fs.readFileSync(localPath);
+    const original = fs.readFileSync(localPath);
+    if (archiveTag) {
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      archiveImage(
+        original,
+        `input_${chatId}_${ts}.jpg`,
+        `[input] uid=${chatId} ${archiveTag} time=${ts}`
+      );
+    }
+    const buffer = useGpt ? await generateFullBody(localPath) : original;
     return await rhUploadImage(buffer, `input_${chatId}_${Date.now()}.png`);
   } finally {
     if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
@@ -651,6 +671,12 @@ async function finalizeTask(taskId, norm) {
       const { buffer, name } = await fetchResultImage(norm.results);
       const balance = await getBalance(info.chatId);
       await tgSendDocument(info.chatId, buffer, name || "result.png", buildCompletionCaption(mode, balance));
+      archiveImage(
+        buffer,
+        `output_${info.chatId}_${taskId}.png`,
+        `[output] uid=${info.chatId} mode=${info.modeKey} taskId=${taskId}`,
+        "image/png"
+      );
       bumpStat("task_success").catch(() => {});
     } else {
       // 失败：内容审核类不退分，其它退分
@@ -931,7 +957,7 @@ async function handleSingleImageMode(chatId, fileId, modeKey, mode) {
     await tgSend(chatId, `⏳ 收到图片（${mode.label}），正在处理...`);
     await maybeNotifyQueue(chatId);
     await limiter.run(async () => {
-      const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt);
+      const imageFileName = await prepareRhImage(chatId, fileId, mode.useGpt, `mode=${modeKey}`);
       await submitAndTrack(chatId, modeKey, buildOldNodes(imageFileName, mode.prompt), mode.cost);
       submitted = true;
     });
@@ -997,8 +1023,9 @@ async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
     await tgSend(chatId, "✅ 衣服图已收到，开始处理...");
     await maybeNotifyQueue(chatId);
     await limiter.run(async () => {
-      const modelFileName = await prepareRhImage(chatId, pendingFileId, mode.useGpt);
-      const clothingFileName = await prepareRhImage(chatId, fileId, false);
+      const modelFileName = await prepareRhImage(chatId, pendingFileId, mode.useGpt, `mode=${modeKey}`);
+      const clothingFileName = await prepareRhImage(chatId, fileId, false); // 衣服图不归档
+
       await submitAndTrack(chatId, modeKey, buildNewNodes(modelFileName, clothingFileName), mode.cost);
       submitted = true;
     });
