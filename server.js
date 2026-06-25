@@ -838,6 +838,43 @@ async function handleCommand(message) {
     return;
   }
 
+  // 管理员撤销/扣减积分：/revoke <用户ID> <积分数量>
+  // 用 SPEND_LUA 做原子扣减，余额不足直接拒绝（避免出现负余额）
+  if (cmd === "/revoke") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const targetId = args[0];
+    const amount = Number(args[1]);
+    if (!targetId || !Number.isInteger(amount) || amount <= 0) {
+      await tgSend(chatId, "用法：/revoke <用户ID> <积分数量>，例如 /revoke 123456789 40");
+      return;
+    }
+    const balance = await spend(targetId, amount);
+    if (balance < 0) {
+      const cur = await getBalance(targetId);
+      await tgSend(chatId, `❌ 扣减失败：用户 ${targetId} 当前余额仅 ${cur}，不足以扣减 ${amount}。`);
+      return;
+    }
+    const yuan = +(amount / CREDITS_PER_YUAN).toFixed(2);
+    // 用负数记录到同一流水，方便 /records 一并看到
+    const record = {
+      time: Date.now(),
+      targetId: String(targetId),
+      credits: -amount,
+      yuan: -yuan,
+      adminId: String(chatId),
+      balanceAfter: balance,
+    };
+    await redis.rpush(K.rechargeLog(), JSON.stringify(record));
+    await tgSend(chatId, `✅ 已从用户 ${targetId} 扣减 ${amount} 积分（约 ¥${yuan}），当前余额：${balance}`);
+    try {
+      await tgSend(targetId, `⚠️ 客服已从你的账户扣减 ${amount} 积分，当前余额：${balance}\n如有疑问请联系客服：${CS_LINK}`);
+    } catch (_) {}
+    return;
+  }
+
   // 管理员导出充值记录为表格文件：/records
   if (cmd === "/records") {
     if (!isAdmin(chatId)) {
