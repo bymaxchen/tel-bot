@@ -234,6 +234,8 @@ const K = {
   inviteFirstRecharge: (newUid) => `invite:first:${newUid}`,     // 被邀请人是否已发生过首次充值（用于累计邀请数）
   inviteFirstTask: (newUid) => `invite:firsttask:${newUid}`,     // 被邀请人是否已发生过首次成功任务（用于积分奖）
   inviteTaskDay: (uid, date) => `invite:taskday:${uid}:${date}`, // 邀请人当日已发放的「首次任务奖」次数（24h TTL）
+  inviteLead: () => `invite:lead`,                               // ZSET：member=邀请人, score=累计返佣分；用于 TOP 榜
+  inviteInvitees: (inviterId) => `invite:invitees:${inviterId}`, // HASH：field=被邀请人, value=累计充值分；用于明细
 };
 
 async function ensureNewUserBonus(id) {
@@ -836,6 +838,7 @@ const SHARE_FOOTER = [
 
 // /invite 命令 + 菜单按钮共用
 async function runInvite(chatId) {
+  bumpStat("invite_view").catch(() => {});
   if (!CONFIG.BOT_USERNAME) {
     await tgSend(chatId, "⚠️ 邀请功能尚未启用（管理员未配置 BOT_USERNAME）。");
     return;
@@ -955,6 +958,11 @@ async function handleReferralOnRecharge(invitedUid, credits, yuan, adminId) {
   if (rebateCents <= 0) return;
 
   const totalCents = await redis.incrby(K.inviteEarnedCents(inviterId), rebateCents);
+  // 全局 TOP 榜：按累计返佣排序
+  redis.zincrby(K.inviteLead(), rebateCents, String(inviterId)).catch(() => {});
+  // 邀请人 → 该被邀请人累计充值额（分），用于 /inviter 明细查询
+  const rechargeCents = Math.round(yuan * 100);
+  redis.hincrby(K.inviteInvitees(inviterId), String(invitedUid), rechargeCents).catch(() => {});
   await redis.rpush(
     K.rechargeLog(),
     JSON.stringify({
@@ -1002,7 +1010,8 @@ async function handleCommand(message) {
     if (isNew) {
       const m = (args[0] || "").match(/^ref_(\d+)$/);
       if (m && m[1] !== String(chatId)) {
-        await redis.set(K.inviteBy(chatId), m[1], "NX").catch(() => {});
+        const bound = await redis.set(K.inviteBy(chatId), m[1], "NX").catch(() => null);
+        if (bound === "OK") bumpStat("invite_bound").catch(() => {});
       }
     }
     const welcome = isNew
@@ -1086,6 +1095,88 @@ async function handleCommand(message) {
         `🎛 当前模式：${modeKey || DEFAULT_MODE}`,
       ].join("\n")
     );
+    return;
+  }
+
+  // 邀请人 TOP 榜：/leaderboard [N]，默认 10
+  if (cmd === "/leaderboard") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const topN = Math.min(Math.max(Number(args[0]) || 10, 1), 50);
+    const raw = await redis.zrevrange(K.inviteLead(), 0, topN - 1, "WITHSCORES");
+    if (!raw.length) {
+      await tgSend(chatId, "暂无邀请数据。");
+      return;
+    }
+    const lines = [`🏆 邀请人 TOP ${raw.length / 2}（按累计返佣）`, ""];
+    for (let i = 0; i < raw.length; i += 2) {
+      const uid = raw[i];
+      const rebateYuan = (Number(raw[i + 1]) || 0) / 100;
+      // 一次取两条计数，省命令
+      const [firstRecharge, firstTask] = await Promise.all([
+        redis.get(K.inviteCount(uid)),
+        // 没有"已奖励次数"这个全量计数，用 invitees HASH 的字段数近似
+        redis.hlen(K.inviteInvitees(uid)),
+      ]);
+      lines.push(
+        `${(i / 2) + 1}. uid=${uid}  返佣 ¥${rebateYuan.toFixed(2)}  首充 ${Number(firstRecharge) || 0} 人  覆盖 ${Number(firstTask) || 0} 人`
+      );
+    }
+    lines.push("", "提示：/inviter <uid> 查看某邀请人详情");
+    await tgSend(chatId, lines.join("\n"));
+    return;
+  }
+
+  // 单个邀请人深挖：/inviter <uid>
+  if (cmd === "/inviter") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const targetId = args[0];
+    if (!targetId || !/^\d+$/.test(targetId)) {
+      await tgSend(chatId, "用法：/inviter <邀请人ID>，例如 /inviter 123456789");
+      return;
+    }
+    const [count, earnedCents, withdrawnCents, invitees] = await Promise.all([
+      redis.get(K.inviteCount(targetId)),
+      redis.get(K.inviteEarnedCents(targetId)),
+      redis.get(K.inviteWithdrawnCents(targetId)),
+      redis.hgetall(K.inviteInvitees(targetId)),
+    ]);
+    const inviteCount = Number(count) || 0;
+    const earnedYuan = (Number(earnedCents) || 0) / 100;
+    const withdrawnYuan = (Number(withdrawnCents) || 0) / 100;
+    const availableYuan = earnedYuan - withdrawnYuan;
+    const entries = Object.entries(invitees || {}); // [uid, rechargeCents字符串]
+    entries.sort((a, b) => Number(b[1]) - Number(a[1]));
+
+    const lines = [
+      `🔎 邀请人 ${targetId} 的明细`,
+      "",
+      `📊 概况`,
+      `• 首充人数：${inviteCount}`,
+      `• 累计返佣：¥${earnedYuan.toFixed(2)}`,
+      `• 已提现：¥${withdrawnYuan.toFixed(2)}`,
+      `• 可提现：¥${availableYuan.toFixed(2)}`,
+      "",
+    ];
+    if (entries.length === 0) {
+      lines.push("该用户尚无任何充值过的被邀请人。");
+    } else {
+      lines.push(`💰 已充值的被邀请人（共 ${entries.length} 人，按金额降序）：`);
+      const TOP = 30;
+      for (const [uid, cents] of entries.slice(0, TOP)) {
+        const yuan = (Number(cents) || 0) / 100;
+        lines.push(`  • uid=${uid}　充值 ¥${yuan.toFixed(2)}`);
+      }
+      if (entries.length > TOP) {
+        lines.push(`  ... 还有 ${entries.length - TOP} 人未显示`);
+      }
+    }
+    await tgSend(chatId, lines.join("\n"));
     return;
   }
 
@@ -1276,8 +1367,8 @@ async function handleCommand(message) {
         `签到次数：${n("checkin")}`,
         `积分消耗：${n("credits_spent")}　退还：${n("credits_refund")}`,
         `各模式提交：${modeLine}`,
-        `邀请首单：${n("invite_task_bonus")} 次（赠积分 ${n("invite_task_bonus") * REFERRAL_TASK_BONUS}）`,
-        `首充人数：${n("invite_first_recharge")}　返佣发出：¥${(n("invite_rebate_cents") / 100).toFixed(2)}`,
+        `邀请漏斗：链接绑定 ${n("invite_bound")} → 首单 ${n("invite_task_bonus")} → 首充 ${n("invite_first_recharge")} → 返佣 ¥${(n("invite_rebate_cents") / 100).toFixed(2)}`,
+        `分享意愿：/invite 被点击 ${n("invite_view")} 次　积分奖发出 ${n("invite_task_bonus") * REFERRAL_TASK_BONUS}`,
         ``,
         `提示：/stats 2026-06-23 可看历史，保留 90 天`,
       ].join("\n")
