@@ -100,6 +100,8 @@ const NEW_USER_BONUS = 2; // 新用户首次进入赠送积分
 
 // 邀请返佣
 const REFERRAL_REBATE_RATE = 0.4;        // 被邀请人每次充值，邀请人返佣比例（按金额）
+const REFERRAL_TASK_BONUS = 10;          // 被邀请人首次成功完成任务时，邀请人获得的积分
+const REFERRAL_TASK_DAILY_CAP = 20;      // 邀请人单日最多获得多少次「首次任务奖」（防刷）
 const WITHDRAW_MIN_YUAN = 50;            // 提现门槛（元）
 
 // /help 使用说明
@@ -133,10 +135,11 @@ const HELP_TEXT = [
   "• mode1 / mode3：附加到默认提示词后，让效果更贴近你的需求。例如：「巨乳，阴部有很多毛」「巨乳，双手抓胸」等具体的描述词（不写也可以，按默认处理）",
   "• mode5：完全由你的提示词决定效果，必须写。例如：「全部去衣 保持人物比列不变，保持面部直接不变，中国女性; 巨乳，双手抓自己的胸部。」",
   "",
-  "🤝 邀请好友赚现金",
+  "🤝 邀请好友赚积分 + 现金",
   `• 发送 /invite 获取你的专属邀请链接`,
+  `• 好友完成首次 AI 任务 → 你立得 ${REFERRAL_TASK_BONUS} 积分`,
   `• 好友每次充值 → 你获 40% 现金返佣（充 ¥100 = 返 ¥40）`,
-  `• 累计达 ¥${WITHDRAW_MIN_YUAN} 可发送 /withdraw 联系客服提现`,
+  `• 累计返佣达 ¥${WITHDRAW_MIN_YUAN} 可发送 /withdraw 联系客服提现`,
   "",
   "💎 积分",
   `• 新用户首次进入赠送 ${NEW_USER_BONUS} 积分 🎁`,
@@ -229,6 +232,8 @@ const K = {
   inviteEarnedCents: (uid) => `invite:earned_cents:${uid}`,      // 我累计获得的返佣金额（分）
   inviteWithdrawnCents: (uid) => `invite:withdrawn_cents:${uid}`,// 我已提现的金额（分）
   inviteFirstRecharge: (newUid) => `invite:first:${newUid}`,     // 被邀请人是否已发生过首次充值（用于累计邀请数）
+  inviteFirstTask: (newUid) => `invite:firsttask:${newUid}`,     // 被邀请人是否已发生过首次成功任务（用于积分奖）
+  inviteTaskDay: (uid, date) => `invite:taskday:${uid}:${date}`, // 邀请人当日已发放的「首次任务奖」次数（24h TTL）
 };
 
 async function ensureNewUserBonus(id) {
@@ -495,20 +500,26 @@ async function isPromoChannelMember(uid) {
 
 // 给未加入频道的用户发引导消息
 function tgSendJoinPrompt(chatId, action = "完成此操作") {
-  const url = CONFIG.PROMO_CHANNEL_URL || `https://t.me/${String(CONFIG.PROMO_CHANNEL_ID).replace(/^@/, "")}`;
-  return tgSend(
-    chatId,
-    [
-      `📣 加入官方频道才能${action}`,
-      ``,
-      `点下方按钮加入频道，加入后再发送命令即可。`,
-      `频道里会发布最新玩法、福利活动和优惠～`,
-    ].join("\n"),
-    {
-      disable_web_page_preview: true,
-      reply_markup: { inline_keyboard: [[{ text: "📣 加入官方频道", url }]] },
+  // 只接受真正的 t.me 链接；纯 ID（-100xxxxxx）不能用来拼 t.me URL（TG 会当成手机号）
+  // 公开频道 ID 形如 @xxx 时可拼 https://t.me/xxx；其它情况必须显式配 PROMO_CHANNEL_URL
+  let url = CONFIG.PROMO_CHANNEL_URL;
+  if (!url) {
+    const idStr = String(CONFIG.PROMO_CHANNEL_ID || "");
+    if (idStr.startsWith("@")) {
+      url = `https://t.me/${idStr.slice(1)}`;
     }
-  );
+  }
+  const text = [
+    `📣 加入官方频道才能${action}`,
+    ``,
+    url ? "点下方按钮加入频道，加入后再发送命令即可。" : "⚠️ 频道入群门已开启但管理员未配置加入链接，请联系客服。",
+    `频道里会发布最新玩法、福利活动和优惠～`,
+  ].join("\n");
+  const extra = { disable_web_page_preview: true };
+  if (url) {
+    extra.reply_markup = { inline_keyboard: [[{ text: "📣 加入官方频道", url }]] };
+  }
+  return tgSend(chatId, text, extra);
 }
 
 // =============================================
@@ -753,6 +764,9 @@ async function finalizeTask(taskId, norm) {
         "image/png"
       );
       bumpStat("task_success").catch(() => {});
+      handleReferralOnTaskSuccess(info.chatId).catch((e) =>
+        console.error("邀请任务奖处理失败：", e.message)
+      );
     } else {
       // 失败：内容审核类不退分，其它退分
       let tip;
@@ -813,10 +827,11 @@ function sendModeMenu(chatId) {
 const SHARE_FOOTER = [
   "",
   "━━━━━━━━━━━━━━",
-  "🤝 分享链接还能赚现金：",
-  `• 好友每次充值你拿 ${Math.round(REFERRAL_REBATE_RATE * 100)}% 现金返佣（充 ¥100 = 你赚 ¥40）`,
-  "• 发送 /invite 获取你的专属邀请链接和战绩",
-  "• 发送 /withdraw 申请提现（门槛 ¥50）",
+  "🤝 邀请好友还能赚积分和现金：",
+  `• 好友完成首次 AI 任务 → 你立得 ${REFERRAL_TASK_BONUS} 积分`,
+  `• 好友每次充值 → 你拿 ${Math.round(REFERRAL_REBATE_RATE * 100)}% 现金返佣（充 ¥100 = 你赚 ¥40）`,
+  "• 发送 /invite 获取专属邀请链接和战绩",
+  `• 累计返佣 ≥ ¥${WITHDRAW_MIN_YUAN} 可发 /withdraw 申请提现`,
 ].join("\n");
 
 // /invite 命令 + 菜单按钮共用
@@ -843,7 +858,8 @@ async function runInvite(chatId) {
       `🔗 你的专属邀请链接：`,
       link,
       "",
-      "🎁 奖励规则：",
+      "🎁 双重奖励：",
+      `• 好友完成首次 AI 任务 → 你立得 ${REFERRAL_TASK_BONUS} 积分`,
       `• 好友每次充值 → 你获 ${Math.round(REFERRAL_REBATE_RATE * 100)}% 现金返佣（按充值金额计算）`,
       `• 例：好友充 ¥100 → 你拿 ¥${(100 * REFERRAL_REBATE_RATE).toFixed(0)} 现金返佣`,
       "",
@@ -896,6 +912,36 @@ async function runWithdraw(chatId) {
       reply_markup: { inline_keyboard: [[{ text: "👩‍💼 联系客服提现", url: CS_LINK }]] },
     }
   );
+}
+
+// 被邀请人首次成功完成任务时：给邀请人 +REFERRAL_TASK_BONUS 积分（一次性，带日上限防刷）
+async function handleReferralOnTaskSuccess(invitedUid) {
+  const inviterId = await redis.get(K.inviteBy(invitedUid));
+  if (!inviterId) return;
+  if (String(inviterId) === String(invitedUid)) return;
+
+  // 该被邀请人是否已结算过首次任务奖
+  const firstTime = await redis.set(K.inviteFirstTask(invitedUid), "1", "NX");
+  if (firstTime !== "OK") return;
+
+  // 邀请人日上限保护
+  const today = shanghaiDate();
+  const dayKey = K.inviteTaskDay(inviterId, today);
+  const dayCount = await redis.incr(dayKey);
+  if (dayCount === 1) await redis.expire(dayKey, 172800);
+  if (dayCount > REFERRAL_TASK_DAILY_CAP) {
+    console.warn(`[referral] 邀请人 ${inviterId} 今日已达任务奖上限 (${REFERRAL_TASK_DAILY_CAP})，跳过`);
+    return;
+  }
+
+  const newBal = await redis.incrby(K.credits(inviterId), REFERRAL_TASK_BONUS);
+  bumpStat("invite_task_bonus").catch(() => {});
+  try {
+    await tgSend(
+      inviterId,
+      `🎁 邀请奖励！你邀请的好友完成了首次 AI 任务，奖励 ${REFERRAL_TASK_BONUS} 积分（当前余额：${newBal}）`
+    );
+  } catch (_) {}
 }
 
 // 被邀请人每次被 /grant 充值时：按金额给邀请人累计 40% 现金返佣（用「分」做整数存储）
@@ -1230,6 +1276,7 @@ async function handleCommand(message) {
         `签到次数：${n("checkin")}`,
         `积分消耗：${n("credits_spent")}　退还：${n("credits_refund")}`,
         `各模式提交：${modeLine}`,
+        `邀请首单：${n("invite_task_bonus")} 次（赠积分 ${n("invite_task_bonus") * REFERRAL_TASK_BONUS}）`,
         `首充人数：${n("invite_first_recharge")}　返佣发出：¥${(n("invite_rebate_cents") / 100).toFixed(2)}`,
         ``,
         `提示：/stats 2026-06-23 可看历史，保留 90 天`,
