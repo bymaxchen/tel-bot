@@ -45,6 +45,15 @@ const CONFIG = {
   // 归档频道（可选）：配置后用户模特图 + 结果图都会发一份到这个私有频道
   ARCHIVE_CHANNEL_ID: process.env.ARCHIVE_CHANNEL_ID || "",
 
+  // 机器人用户名（不带 @），用于生成邀请链接 https://t.me/<BOT_USERNAME>?start=ref_<uid>
+  BOT_USERNAME: (process.env.BOT_USERNAME || "").replace(/^@/, ""),
+
+  // 推广频道（可选）：配置后 /checkin 需要先加入此频道
+  //   PROMO_CHANNEL_ID  ：@your_channel 或 -100xxxxxxxxxx；机器人需是该频道管理员
+  //   PROMO_CHANNEL_URL ：用户点按钮加入的公开链接，如 https://t.me/your_channel 或 t.me/+inviteHash
+  PROMO_CHANNEL_ID: process.env.PROMO_CHANNEL_ID || "",
+  PROMO_CHANNEL_URL: process.env.PROMO_CHANNEL_URL || "",
+
   // GPT 全身图提示词
   GPT_MODEL: "gpt-image-2",
   GPT_PROMPT:
@@ -89,6 +98,10 @@ const CREDITS_PER_YUAN = 4; // 1 元 = 4 积分
 const MIN_RECHARGE_YUAN = 10; // 最低 10 元起充
 const NEW_USER_BONUS = 2; // 新用户首次进入赠送积分
 
+// 邀请返佣
+const REFERRAL_REBATE_RATE = 0.4;        // 被邀请人每次充值，邀请人返佣比例（按金额）
+const WITHDRAW_MIN_YUAN = 50;            // 提现门槛（元）
+
 // /help 使用说明
 const HELP_TEXT = [
   "🤖 使用帮助",
@@ -120,6 +133,11 @@ const HELP_TEXT = [
   "• mode1 / mode3：附加到默认提示词后，让效果更贴近你的需求。例如：「巨乳，阴部有很多毛」「巨乳，双手抓胸」等具体的描述词（不写也可以，按默认处理）",
   "• mode5：完全由你的提示词决定效果，必须写。例如：「全部去衣 保持人物比列不变，保持面部直接不变，中国女性; 巨乳，双手抓自己的胸部。」",
   "",
+  "🤝 邀请好友赚现金",
+  `• 发送 /invite 获取你的专属邀请链接`,
+  `• 好友每次充值 → 你获 40% 现金返佣（充 ¥100 = 返 ¥40）`,
+  `• 累计达 ¥${WITHDRAW_MIN_YUAN} 可发送 /withdraw 联系客服提现`,
+  "",
   "💎 积分",
   `• 新用户首次进入赠送 ${NEW_USER_BONUS} 积分 🎁`,
   "• 每天发送 /checkin 签到领 1 积分",
@@ -134,7 +152,7 @@ const HELP_TEXT = [
   "• 图片过于暴露可能被系统拦截，换张图即可",
   "",
   "📖 命令一览",
-  "/start 开始 ｜ /mode 选模式 ｜ /checkin 签到 ｜ /balance 余额 ｜ /help 帮助",
+  "/start 开始 ｜ /mode 选模式 ｜ /checkin 签到 ｜ /balance 余额 ｜ /invite 邀请 ｜ /withdraw 提现 ｜ /help 帮助",
 ].join("\n");
 
 // 内容审核类失败：不退积分（用户图片/提示词本身问题）
@@ -205,6 +223,12 @@ const K = {
   statsMode: (date) => `stats:mode:${date}`,
   dau: (date) => `dau:${date}`,
   userInit: (id) => `user:init:${id}`,
+  // 邀请系统
+  inviteBy: (newUid) => `invite:by:${newUid}`,                   // 谁邀请了这个新用户（永久绑定）
+  inviteCount: (uid) => `invite:count:${uid}`,                   // 我累计成功邀请了多少人
+  inviteEarnedCents: (uid) => `invite:earned_cents:${uid}`,      // 我累计获得的返佣金额（分）
+  inviteWithdrawnCents: (uid) => `invite:withdrawn_cents:${uid}`,// 我已提现的金额（分）
+  inviteFirstRecharge: (newUid) => `invite:first:${newUid}`,     // 被邀请人是否已发生过首次充值（用于累计邀请数）
 };
 
 async function ensureNewUserBonus(id) {
@@ -445,6 +469,46 @@ function archiveImage(buffer, filename, caption, contentType = "image/jpeg") {
   if (!CONFIG.ARCHIVE_CHANNEL_ID) return Promise.resolve();
   return tgSendDocument(CONFIG.ARCHIVE_CHANNEL_ID, buffer, filename, caption, contentType)
     .catch((e) => console.error("归档失败：", e.message));
+}
+
+// 检查用户是否已加入推广频道。未配置 PROMO_CHANNEL_ID 时直接放行；
+// API 查询失败也放行（避免 TG 短时抖动误伤合法用户）。
+// 机器人必须是该频道管理员，否则 getChatMember 会返回错误。
+async function isPromoChannelMember(uid) {
+  if (!CONFIG.PROMO_CHANNEL_ID) return true;
+  try {
+    const res = await telegramRequest("getChatMember", {
+      chat_id: CONFIG.PROMO_CHANNEL_ID,
+      user_id: Number(uid),
+    });
+    if (!res.ok) {
+      console.warn("getChatMember 失败：", res.description);
+      return true;
+    }
+    const status = res.result?.status;
+    return ["creator", "administrator", "member", "restricted"].includes(status);
+  } catch (e) {
+    console.error("getChatMember 异常：", e.message);
+    return true;
+  }
+}
+
+// 给未加入频道的用户发引导消息
+function tgSendJoinPrompt(chatId, action = "完成此操作") {
+  const url = CONFIG.PROMO_CHANNEL_URL || `https://t.me/${String(CONFIG.PROMO_CHANNEL_ID).replace(/^@/, "")}`;
+  return tgSend(
+    chatId,
+    [
+      `📣 加入官方频道才能${action}`,
+      ``,
+      `点下方按钮加入频道，加入后再发送命令即可。`,
+      `频道里会发布最新玩法、福利活动和优惠～`,
+    ].join("\n"),
+    {
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: [[{ text: "📣 加入官方频道", url }]] },
+    }
+  );
 }
 
 // =============================================
@@ -741,6 +805,52 @@ function sendModeMenu(chatId) {
   });
 }
 
+// 被邀请人每次被 /grant 充值时：按金额给邀请人累计 40% 现金返佣（用「分」做整数存储）
+// 同时在被邀请人首次充值时把累计邀请数 +1，用于战绩展示
+async function handleReferralOnRecharge(invitedUid, credits, yuan, adminId) {
+  const inviterId = await redis.get(K.inviteBy(invitedUid));
+  if (!inviterId) return;
+  if (String(inviterId) === String(invitedUid)) return; // 双保险
+
+  const rebateCents = Math.floor(yuan * REFERRAL_REBATE_RATE * 100);
+  if (rebateCents <= 0) return;
+
+  const totalCents = await redis.incrby(K.inviteEarnedCents(inviterId), rebateCents);
+  await redis.rpush(
+    K.rechargeLog(),
+    JSON.stringify({
+      time: Date.now(),
+      type: "referral_rebate",
+      targetId: String(inviterId),
+      fromUserId: String(invitedUid),
+      rebateYuan: rebateCents / 100,
+      adminId: String(adminId),
+      earnedTotalYuan: totalCents / 100,
+    })
+  );
+  bumpStat("invite_rebate_cents", rebateCents).catch(() => {});
+
+  // 首次充值时累计邀请数 +1（仅做战绩统计，无积分奖励）
+  const isFirstRecharge = await redis.set(K.inviteFirstRecharge(invitedUid), "1", "NX");
+  if (isFirstRecharge === "OK") {
+    await redis.incr(K.inviteCount(inviterId));
+    bumpStat("invite_first_recharge").catch(() => {});
+  }
+
+  try {
+    await tgSend(
+      inviterId,
+      [
+        `💰 返佣到账！`,
+        `你邀请的好友充值了 ¥${yuan}，你获得 ${Math.round(REFERRAL_REBATE_RATE * 100)}% 返佣 ¥${(rebateCents / 100).toFixed(2)}`,
+        `累计返佣：¥${(totalCents / 100).toFixed(2)}`,
+        ``,
+        `发送 /invite 查看战绩，/withdraw 申请提现（门槛 ¥${WITHDRAW_MIN_YUAN}）`,
+      ].join("\n")
+    );
+  } catch (_) {}
+}
+
 async function handleCommand(message) {
   const chatId = message.chat.id;
   const cmd = message.text.trim().split(/\s+/)[0].replace(/@.*$/, "");
@@ -749,6 +859,13 @@ async function handleCommand(message) {
   const isNew = await ensureNewUserBonus(chatId).catch(() => false);
 
   if (cmd === "/start") {
+    // 邀请绑定：仅新人 + ref_<数字> 格式 + 不是自邀，才永久绑定
+    if (isNew) {
+      const m = (args[0] || "").match(/^ref_(\d+)$/);
+      if (m && m[1] !== String(chatId)) {
+        await redis.set(K.inviteBy(chatId), m[1], "NX").catch(() => {});
+      }
+    }
     const welcome = isNew
       ? `👋 欢迎使用！已赠送 ${NEW_USER_BONUS} 积分新人礼 🎁\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始：`
       : "👋 欢迎使用！\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始：";
@@ -771,6 +888,10 @@ async function handleCommand(message) {
   }
 
   if (cmd === "/checkin") {
+    if (!(await isPromoChannelMember(chatId))) {
+      await tgSendJoinPrompt(chatId, "签到领积分");
+      return;
+    }
     const { checked, balance } = await checkin(chatId);
     await tgSend(
       chatId,
@@ -786,6 +907,87 @@ async function handleCommand(message) {
     await tgSend(
       chatId,
       `💎 当前积分：${balance}\n🆔 你的用户ID：${chatId}\n\n积分不足可发送 /checkin 每日签到，或把上面的用户ID发给客服充值。`
+    );
+    return;
+  }
+
+  // 邀请好友：返回专属链接 + 战绩
+  if (cmd === "/invite") {
+    if (!CONFIG.BOT_USERNAME) {
+      await tgSend(chatId, "⚠️ 邀请功能尚未启用（管理员未配置 BOT_USERNAME）。");
+      return;
+    }
+    const [count, earnedCents, withdrawnCents] = await Promise.all([
+      redis.get(K.inviteCount(chatId)),
+      redis.get(K.inviteEarnedCents(chatId)),
+      redis.get(K.inviteWithdrawnCents(chatId)),
+    ]);
+    const inviteCount = Number(count) || 0;
+    const earnedYuan = (Number(earnedCents) || 0) / 100;
+    const withdrawnYuan = (Number(withdrawnCents) || 0) / 100;
+    const availableYuan = earnedYuan - withdrawnYuan;
+    const link = `https://t.me/${CONFIG.BOT_USERNAME}?start=ref_${chatId}`;
+    await tgSend(
+      chatId,
+      [
+        "🤝 邀请好友赚现金",
+        "",
+        `🔗 你的专属邀请链接：`,
+        link,
+        "",
+        "🎁 奖励规则：",
+        `• 好友每次充值 → 你获 ${Math.round(REFERRAL_REBATE_RATE * 100)}% 现金返佣（按充值金额计算）`,
+        `• 例：好友充 ¥100 → 你拿 ¥${(100 * REFERRAL_REBATE_RATE).toFixed(0)} 现金返佣`,
+        "",
+        "📊 我的战绩：",
+        `• 累计成功邀请：${inviteCount} 人`,
+        `• 累计返佣金额：¥${earnedYuan.toFixed(2)}`,
+        `• 已提现金额：¥${withdrawnYuan.toFixed(2)}`,
+        `• 可提现余额：¥${availableYuan.toFixed(2)}`,
+        "",
+        `💸 提现门槛 ¥${WITHDRAW_MIN_YUAN}，发送 /withdraw 申请提现`,
+      ].join("\n"),
+      { disable_web_page_preview: true }
+    );
+    return;
+  }
+
+  // 申请提现：当前为人工打款，引导联系客服
+  if (cmd === "/withdraw") {
+    const [earnedCents, withdrawnCents] = await Promise.all([
+      redis.get(K.inviteEarnedCents(chatId)),
+      redis.get(K.inviteWithdrawnCents(chatId)),
+    ]);
+    const availableYuan = ((Number(earnedCents) || 0) - (Number(withdrawnCents) || 0)) / 100;
+    if (availableYuan < WITHDRAW_MIN_YUAN) {
+      await tgSend(
+        chatId,
+        [
+          `💸 当前可提现金额：¥${availableYuan.toFixed(2)}`,
+          `❌ 未达到提现门槛 ¥${WITHDRAW_MIN_YUAN}，继续邀请好友充值即可累计。`,
+          ``,
+          `发送 /invite 查看你的邀请链接和战绩。`,
+        ].join("\n")
+      );
+      return;
+    }
+    await tgSend(
+      chatId,
+      [
+        `💸 申请提现`,
+        `当前可提现：¥${availableYuan.toFixed(2)}（门槛 ¥${WITHDRAW_MIN_YUAN}）`,
+        ``,
+        `当前为人工打款（未来将自动化）。请联系客服并提供以下信息：`,
+        `  • 你的用户ID：${chatId}`,
+        `  • 提现金额：¥${availableYuan.toFixed(2)}`,
+        `  • 收款方式：支付宝 / 微信 收款码或账号`,
+        ``,
+        `👉 客服：${CS_LINK}`,
+      ].join("\n"),
+      {
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: "👩‍💼 联系客服提现", url: CS_LINK }]] },
+      }
     );
     return;
   }
@@ -848,6 +1050,59 @@ async function handleCommand(message) {
     await tgSend(chatId, `✅ 已给用户 ${targetId} 充值 ${amount} 积分（约 ¥${yuan}），当前余额：${balance}`);
     try {
       await tgSend(targetId, `🎉 客服为你充值了 ${amount} 积分，当前余额：${balance}`);
+    } catch (_) {}
+
+    // ===== 邀请返佣 =====
+    await handleReferralOnRecharge(targetId, amount, yuan, chatId).catch((e) => {
+      console.error("返佣处理失败：", e);
+    });
+    return;
+  }
+
+  // 管理员记录已人工打款：/withdrawn <用户ID> <金额元>
+  // 把已支付的金额加到 invite:withdrawn_cents 上，可提现余额 = earned - withdrawn 才会减少
+  if (cmd === "/withdrawn") {
+    if (!isAdmin(chatId)) {
+      await tgSend(chatId, "⛔ 你没有权限使用该命令。");
+      return;
+    }
+    const targetId = args[0];
+    const yuan = Number(args[1]);
+    if (!targetId || !(yuan > 0)) {
+      await tgSend(chatId, "用法：/withdrawn <用户ID> <金额元>，例如 /withdrawn 123456789 50");
+      return;
+    }
+    const [earnedCents, withdrawnCents] = await Promise.all([
+      redis.get(K.inviteEarnedCents(targetId)),
+      redis.get(K.inviteWithdrawnCents(targetId)),
+    ]);
+    const earned = Number(earnedCents) || 0;
+    const withdrawn = Number(withdrawnCents) || 0;
+    const requestCents = Math.round(yuan * 100);
+    if (withdrawn + requestCents > earned) {
+      const availableYuan = (earned - withdrawn) / 100;
+      await tgSend(
+        chatId,
+        `❌ 提现金额超出可提现余额。用户 ${targetId} 当前可提现仅 ¥${availableYuan.toFixed(2)}。`
+      );
+      return;
+    }
+    const newWithdrawn = await redis.incrby(K.inviteWithdrawnCents(targetId), requestCents);
+    await redis.rpush(
+      K.rechargeLog(),
+      JSON.stringify({
+        time: Date.now(),
+        type: "referral_withdraw",
+        targetId: String(targetId),
+        yuan: -yuan,
+        adminId: String(chatId),
+        withdrawnTotalYuan: newWithdrawn / 100,
+      })
+    );
+    const availableYuan = (earned - newWithdrawn) / 100;
+    await tgSend(chatId, `✅ 已记录提现 ¥${yuan} 给用户 ${targetId}（剩余可提现 ¥${availableYuan.toFixed(2)}）`);
+    try {
+      await tgSend(targetId, `💸 客服已为你完成提现 ¥${yuan}，请查收。\n剩余可提现：¥${availableYuan.toFixed(2)}`);
     } catch (_) {}
     return;
   }
@@ -955,6 +1210,7 @@ async function handleCommand(message) {
         `签到次数：${n("checkin")}`,
         `积分消耗：${n("credits_spent")}　退还：${n("credits_refund")}`,
         `各模式提交：${modeLine}`,
+        `首充人数：${n("invite_first_recharge")}　返佣发出：¥${(n("invite_rebate_cents") / 100).toFixed(2)}`,
         ``,
         `提示：/stats 2026-06-23 可看历史，保留 90 天`,
       ].join("\n")
