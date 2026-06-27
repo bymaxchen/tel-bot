@@ -825,6 +825,21 @@ function sendModeMenu(chatId) {
   });
 }
 
+// 给 /start, /balance 加充值客服引导
+const RECHARGE_FOOTER = [
+  "",
+  "━━━━━━━━━━━━━━",
+  "💰 充值积分",
+  `• 1 元 = ${CREDITS_PER_YUAN} 积分，最低 ${MIN_RECHARGE_YUAN} 元起充，支持支付宝 / 微信`,
+  "• 把你的用户ID（见 /balance）报给客服即可",
+  `👉 客服：${CS_LINK}`,
+].join("\n");
+
+// 通用按钮组：联系客服充值（用于 /start /balance）
+const RECHARGE_KEYBOARD = {
+  inline_keyboard: [[{ text: "💰 联系客服充值", url: CS_LINK }]],
+};
+
 // 给 /start, /balance, /checkin 的回复加个统一的「邀请赚钱」尾巴
 const SHARE_FOOTER = [
   "",
@@ -1017,7 +1032,10 @@ async function handleCommand(message) {
     const welcome = isNew
       ? `👋 欢迎使用！已赠送 ${NEW_USER_BONUS} 积分新人礼 🎁\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始：`
       : "👋 欢迎使用！\n\n发送 /help 查看完整使用说明；\n每天发送 /checkin 签到可领 1 积分。\n\n下面选择模式，然后发送图片即可开始：";
-    await tgSend(chatId, welcome + SHARE_FOOTER, { disable_web_page_preview: true });
+    await tgSend(chatId, welcome + RECHARGE_FOOTER + SHARE_FOOTER, {
+      disable_web_page_preview: true,
+      reply_markup: RECHARGE_KEYBOARD,
+    });
     await sendModeMenu(chatId);
     return;
   }
@@ -1050,8 +1068,11 @@ async function handleCommand(message) {
 
   if (cmd === "/balance") {
     const balance = await getBalance(chatId);
-    const head = `💎 当前积分：${balance}\n🆔 你的用户ID：${chatId}\n\n积分不足可发送 /checkin 每日签到，或把上面的用户ID发给客服充值。`;
-    await tgSend(chatId, head + SHARE_FOOTER, { disable_web_page_preview: true });
+    const head = `💎 当前积分：${balance}\n🆔 你的用户ID：${chatId}\n\n积分不足可发送 /checkin 每日签到。`;
+    await tgSend(chatId, head + RECHARGE_FOOTER + SHARE_FOOTER, {
+      disable_web_page_preview: true,
+      reply_markup: RECHARGE_KEYBOARD,
+    });
     return;
   }
 
