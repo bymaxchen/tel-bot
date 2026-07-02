@@ -44,6 +44,8 @@ const CONFIG = {
 
   // 归档频道（可选）：配置后用户模特图 + 结果图都会发一份到这个私有频道
   ARCHIVE_CHANNEL_ID: process.env.ARCHIVE_CHANNEL_ID || "",
+  // 小说提示词归档频道（另一个私有频道，仅存 /novel 的完整拼装提示词）
+  NOVEL_ARCHIVE_CHANNEL_ID: process.env.NOVEL_ARCHIVE_CHANNEL_ID || "",
 
   // 机器人用户名（不带 @），用于生成邀请链接 https://t.me/<BOT_USERNAME>?start=ref_<uid>
   BOT_USERNAME: (process.env.BOT_USERNAME || "").replace(/^@/, ""),
@@ -53,6 +55,16 @@ const CONFIG = {
   //   PROMO_CHANNEL_URL ：用户点按钮加入的公开链接，如 https://t.me/your_channel 或 t.me/+inviteHash
   PROMO_CHANNEL_ID: process.env.PROMO_CHANNEL_ID || "",
   PROMO_CHANNEL_URL: process.env.PROMO_CHANNEL_URL || "",
+
+  // DeepSeek（写小说功能）：主模型出正文、副模型跑摘要压缩
+  DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY || "",
+  DEEPSEEK_API_BASE: process.env.DEEPSEEK_API_BASE || "https://api.deepseek.com",
+  DEEPSEEK_MODEL_MAIN: process.env.DEEPSEEK_MODEL_MAIN || "deepseek-v4-flash",
+  DEEPSEEK_MODEL_SUMMARY: process.env.DEEPSEEK_MODEL_SUMMARY || "deepseek-v4-flash",
+  // 本地调试：打印拼装的提示词、DeepSeek 响应、摘要压缩过程
+  NOVEL_DEBUG: /^(1|true|yes)$/i.test(process.env.NOVEL_DEBUG || ""),
+  // 本地调试：所有扣积分操作直接放行，不真的扣（生产环境务必保持为 false）
+  UNLIMITED_CREDITS: /^(1|true|yes)$/i.test(process.env.UNLIMITED_CREDITS || ""),
 
   // GPT 全身图提示词
   GPT_MODEL: "gpt-image-2",
@@ -104,6 +116,22 @@ const REFERRAL_TASK_BONUS = 10;          // 被邀请人首次成功完成任务
 const REFERRAL_TASK_DAILY_CAP = 20;      // 邀请人单日最多获得多少次「首次任务奖」（防刷）
 const WITHDRAW_MIN_YUAN = 50;            // 提现门槛（元）
 
+// 写小说
+const NOVEL_COST = 1;                    // 每次生成扣的积分
+const NOVEL_HISTORY_KEEP = 10;           // 原样保留最近多少条 messages（超出走摘要）
+const NOVEL_SUMMARY_TRIGGER = 14;        // 达到多少条时触发一次摘要压缩
+const NOVEL_MIN_WORDS = 300;
+const NOVEL_MAX_WORDS = 5000;
+
+// 加载预设 JSON（写小说的文风/视角/背景/性描写风格/节奏 → 提示词映射）
+let NOVEL_PRESETS = { style: {}, pov: {}, era: {}, spice: {}, pace: {} };
+try {
+  NOVEL_PRESETS = JSON.parse(fs.readFileSync(path.join(__dirname, "novel-presets.json"), "utf8"));
+  console.log("✅ novel-presets.json 加载成功");
+} catch (e) {
+  console.warn("⚠️ novel-presets.json 加载失败：", e.message, "—— /novel 功能将不可用");
+}
+
 // /help 使用说明
 const HELP_TEXT = [
   "🤖 使用帮助",
@@ -141,6 +169,11 @@ const HELP_TEXT = [
   `• 好友每次充值 → 你获 40% 现金返佣（充 ¥100 = 返 ¥40）`,
   `• 累计返佣达 ¥${WITHDRAW_MIN_YUAN} 可发送 /withdraw 联系客服提现`,
   "",
+  "📖 写小说（/novel）",
+  `• 发送 /novel 进入，可选「预设模式」8 步向导或「自由模式」自己写全部提示词`,
+  `• 每次生成扣 ${NOVEL_COST} 积分，多轮连续写作，AI 会自动记住之前的剧情`,
+  "• /novel_new 换一部｜/novel_end 退出｜/novel_setup 改设定｜/novel_summary 看摘要",
+  "",
   "💎 积分",
   `• 新用户首次进入赠送 ${NEW_USER_BONUS} 积分 🎁`,
   "• 每天发送 /checkin 签到领 1 积分",
@@ -155,7 +188,7 @@ const HELP_TEXT = [
   "• 图片过于暴露可能被系统拦截，换张图即可",
   "",
   "📖 命令一览",
-  "/start 开始 ｜ /mode 选模式 ｜ /checkin 签到 ｜ /balance 余额 ｜ /invite 邀请 ｜ /withdraw 提现 ｜ /help 帮助",
+  "/start 开始 ｜ /mode 选模式 ｜ /novel 写小说 ｜ /checkin 签到 ｜ /balance 余额 ｜ /invite 邀请 ｜ /withdraw 提现 ｜ /help 帮助",
 ].join("\n");
 
 // 内容审核类失败：不退积分（用户图片/提示词本身问题）
@@ -236,6 +269,13 @@ const K = {
   inviteTaskDay: (uid, date) => `invite:taskday:${uid}:${date}`, // 邀请人当日已发放的「首次任务奖」次数（24h TTL）
   inviteLead: () => `invite:lead`,                               // ZSET：member=邀请人, score=累计返佣分；用于 TOP 榜
   inviteInvitees: (inviterId) => `invite:invitees:${inviterId}`, // HASH：field=被邀请人, value=累计充值分；用于明细
+  // 小说模式
+  novelActive: (uid) => `novel:active:${uid}`,     // string "1"：是否处于小说会话中（非向导态）
+  novelSetup: (uid) => `novel:setup:${uid}`,       // HASH：{style,pov,era,spice,pace,character,seed,wordCount}
+  novelWizard: (uid) => `novel:wizard:${uid}`,     // HASH：{step, mode:"preset"|"free"}；仅在向导过程中存在
+  novelHistory: (uid) => `novel:history:${uid}`,   // LIST：最近 K 轮 messages（JSON）
+  novelSummary: (uid) => `novel:summary:${uid}`,   // string：剧情摘要
+  novelBusy: (uid) => `novel:busy:${uid}`,         // string 锁，防用户狂点导致并发调用
 };
 
 async function ensureNewUserBonus(id) {
@@ -336,11 +376,14 @@ async function getBalance(id) {
   return Number(await redis.get(K.credits(id))) || 0;
 }
 // 返回新余额(>=0) 或 -1(余额不足)
+// 本地调试开关：UNLIMITED_CREDITS=1 时不真扣，直接返回一个大数，方便刷任务/写小说压测
 async function spend(id, cost) {
+  if (CONFIG.UNLIMITED_CREDITS) return 999999;
   const res = await redis.eval(SPEND_LUA, 1, K.credits(id), cost);
   return Number(res);
 }
 async function refund(id, cost) {
+  if (CONFIG.UNLIMITED_CREDITS) return 999999;
   return Number(await redis.incrby(K.credits(id), cost));
 }
 
@@ -476,6 +519,78 @@ function archiveImage(buffer, filename, caption, contentType = "image/jpeg") {
   if (!CONFIG.ARCHIVE_CHANNEL_ID) return Promise.resolve();
   return tgSendDocument(CONFIG.ARCHIVE_CHANNEL_ID, buffer, filename, caption, contentType)
     .catch((e) => console.error("归档失败：", e.message));
+}
+
+// 归档小说的整套提示词到私有频道。以 .txt 文件发送，caption 里带 uid+时间。
+// 内容包括：完整 system prompt + 全部 history + 本次 user turn，方便你逐字复盘。
+function archiveNovelPrompt(chatId, messages, tag = "") {
+  if (!CONFIG.NOVEL_ARCHIVE_CHANNEL_ID) return Promise.resolve();
+  const lines = ["===== NOVEL PROMPT =====", `uid=${chatId}`, `time=${new Date().toISOString()}`, `tag=${tag}`, ""];
+  messages.forEach((m, i) => {
+    lines.push(`----- [${i}] role=${m.role} (len=${(m.content || "").length}) -----`);
+    lines.push(m.content || "");
+    lines.push("");
+  });
+  const buf = Buffer.from(lines.join("\n"), "utf8");
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  return tgSendDocument(
+    CONFIG.NOVEL_ARCHIVE_CHANNEL_ID,
+    buf,
+    `novel_${chatId}_${ts}.txt`,
+    `[novel] uid=${chatId} ${tag}`,
+    "text/plain; charset=utf-8"
+  ).catch((e) => console.error("小说归档失败：", e.message));
+}
+
+// =============================================
+//  DeepSeek 客户端（OpenAI 兼容协议）
+// =============================================
+// 本地调试：把拼装的 messages / 响应 / 摘要过程漂亮地打到控制台
+function novelDebug(tag, payload) {
+  if (!CONFIG.NOVEL_DEBUG) return;
+  const bar = "=".repeat(20);
+  console.log(`\n${bar} [NOVEL_DEBUG] ${tag} ${bar}`);
+  if (Array.isArray(payload)) {
+    // messages 数组：一条一条打，方便读
+    payload.forEach((m, i) => {
+      const preview = String(m.content || "").slice(0, 2000);
+      console.log(`--- [${i}] role=${m.role} (len=${(m.content || "").length}) ---`);
+      console.log(preview);
+      if ((m.content || "").length > 2000) console.log(`... (截断，实际还有 ${(m.content || "").length - 2000} 字)`);
+    });
+  } else if (typeof payload === "string") {
+    console.log(payload.slice(0, 3000));
+    if (payload.length > 3000) console.log(`... (截断，实际还有 ${payload.length - 3000} 字)`);
+  } else {
+    console.log(JSON.stringify(payload, null, 2));
+  }
+  console.log(`${bar} [/NOVEL_DEBUG] ${tag} ${bar}\n`);
+}
+
+async function deepseekChat(model, messages, { maxTokens = 4000, temperature = 0.9 } = {}) {
+  if (!CONFIG.DEEPSEEK_API_KEY) throw new Error("未配置 DEEPSEEK_API_KEY");
+  const res = await fetch(`${CONFIG.DEEPSEEK_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${CONFIG.DEEPSEEK_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+      stream: false,
+    }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg = data?.error?.message || JSON.stringify(data).slice(0, 300);
+    throw new Error(`DeepSeek HTTP ${res.status}: ${msg}`);
+  }
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) throw new Error("DeepSeek 返回空内容：" + JSON.stringify(data).slice(0, 300));
+  return text;
 }
 
 // 检查用户是否已加入推广频道。未配置 PROMO_CHANNEL_ID 时直接放行；
@@ -815,6 +930,7 @@ function sendModeMenu(chatId) {
         ],
         [
           { text: `${MODES.mode5.label}(${MODES.mode5.cost})`, callback_data: "mode5" },
+          { text: `📖 写小说(${NOVEL_COST}/次)`, callback_data: "open_novel" },
         ],
         [
           { text: "🤝 邀请赚现金", callback_data: "invite" },
@@ -1085,6 +1201,75 @@ async function handleCommand(message) {
   // 申请提现：当前为人工打款，引导联系客服
   if (cmd === "/withdraw") {
     await runWithdraw(chatId);
+    return;
+  }
+
+  // ===== 写小说 =====
+  if (cmd === "/novel") {
+    if (!CONFIG.DEEPSEEK_API_KEY) {
+      await tgSend(chatId, "⚠️ 写小说功能尚未启用（管理员未配置 DEEPSEEK_API_KEY）。");
+      return;
+    }
+    // 如果已经在会话中，提示可以直接继续
+    if (await redis.exists(K.novelActive(chatId))) {
+      await tgSend(
+        chatId,
+        [
+          "📖 你已经在小说会话中，直接发消息即可继续写作。",
+          "",
+          "💡 常用指令：",
+          "• 直接发文字 → 继续写作（每次扣 " + NOVEL_COST + " 积分）",
+          "• /novel_new  → 换一部新小说（清空所有上下文）",
+          "• /novel_setup → 重新配置设定",
+          "• /novel_end  → 退出小说模式",
+          "• /novel_summary → 查看当前剧情摘要",
+        ].join("\n")
+      );
+      return;
+    }
+    await tgSend(chatId, "📖 开始写一部成人小说\n\n请选择创作方式：", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📋 预设模式（引导 7 步）", callback_data: "novel_preset" }],
+          [{ text: "✍️ 自由模式（自己写全部提示词）", callback_data: "novel_free" }],
+        ],
+      },
+    });
+    return;
+  }
+  if (cmd === "/novel_new") {
+    await redis.del(K.novelActive(chatId));
+    await redis.del(K.novelWizard(chatId));
+    await redis.del(K.novelSetup(chatId));
+    await redis.del(K.novelHistory(chatId));
+    await redis.del(K.novelSummary(chatId));
+    await tgSend(chatId, "🗑 已清空当前小说的所有上下文。发送 /novel 开始新的一部。");
+    return;
+  }
+  if (cmd === "/novel_end") {
+    await redis.del(K.novelActive(chatId));
+    await redis.del(K.novelWizard(chatId));
+    await tgSend(chatId, "🚪 已退出小说模式。设定和剧情已保留，再次 /novel 可以继续写。");
+    return;
+  }
+  if (cmd === "/novel_setup") {
+    if (!(await redis.exists(K.novelSetup(chatId)))) {
+      await tgSend(chatId, "还没有小说设定，请发送 /novel 从头开始。");
+      return;
+    }
+    await tgSend(chatId, "🔁 重新配置设定（会保留已有剧情和历史）：", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📋 走预设向导", callback_data: "novel_preset" }],
+          [{ text: "✍️ 走自由模式", callback_data: "novel_free" }],
+        ],
+      },
+    });
+    return;
+  }
+  if (cmd === "/novel_summary") {
+    const summary = (await redis.get(K.novelSummary(chatId))) || "（暂无摘要——历史条数还未触发压缩）";
+    await tgSend(chatId, `📝 当前剧情摘要：\n\n${summary}`);
     return;
   }
 
@@ -1390,6 +1575,7 @@ async function handleCommand(message) {
         `各模式提交：${modeLine}`,
         `邀请漏斗：链接绑定 ${n("invite_bound")} → 首单 ${n("invite_task_bonus")} → 首充 ${n("invite_first_recharge")} → 返佣 ¥${(n("invite_rebate_cents") / 100).toFixed(2)}`,
         `分享意愿：/invite 被点击 ${n("invite_view")} 次　积分奖发出 ${n("invite_task_bonus") * REFERRAL_TASK_BONUS}`,
+        `小说：生成 ${n("novel_turn")} 次　失败 ${n("novel_fail")} 次`,
         ``,
         `提示：/stats 2026-06-23 可看历史，保留 90 天`,
       ].join("\n")
@@ -1421,9 +1607,473 @@ function modeSelectedText(mode) {
   );
 }
 
+// =============================================
+//  写小说：向导 + 会话 + 摘要压缩
+// =============================================
+const NOVEL_WIZARD_STEPS = ["style", "pov", "era", "character", "spice", "seed", "wordCount"];
+const NOVEL_STEP_LABEL = {
+  style: "文风",
+  pov: "视角",
+  era: "背景时代",
+  character: "人物设定",
+  spice: "性描写风格",
+  seed: "开场情境",
+  wordCount: "每章字数",
+};
+
+function novelPresetButtons(field) {
+  const opts = NOVEL_PRESETS[field] || {};
+  const rows = [];
+  const entries = Object.entries(opts);
+  for (let i = 0; i < entries.length; i += 2) {
+    const row = [];
+    for (let j = i; j < Math.min(i + 2, entries.length); j++) {
+      const [key, cfg] = entries[j];
+      row.push({ text: cfg.label, callback_data: `nvp:${field}:${key}` });
+    }
+    rows.push(row);
+  }
+  rows.push([{ text: "✏️ 自定义（自己写）", callback_data: `nvp:${field}:__custom__` }]);
+  return { inline_keyboard: rows };
+}
+
+// 步骤提示文案（含"自由输入"步骤的引导）
+function novelStepPrompt(step) {
+  if (step === "style") return "🖋 第 1/7 步：选择【文风】";
+  if (step === "pov") return "👁 第 2/7 步：选择【视角】";
+  if (step === "era") return "🏛 第 3/7 步：选择【背景时代】";
+  if (step === "character") {
+    return [
+      "👥 第 4/7 步：【人物设定】（自由输入）",
+      "",
+      "请写下所有角色的详细设定，越具体效果越好：",
+      "",
+      "📌 建议包含：",
+      "• 姓名 / 称呼 / 外号",
+      "• 年龄、身高、身材、外貌（发型、脸型、五官、胸/腰/臀）",
+      "• 常见穿着、气质",
+      "• 性格特点（如：外冷内热、傲娇、爱撒娇）",
+      "• 你（主角）和她的关系（如：直属上司、大学学妹、隔壁人妻）",
+      "• 特殊设定（如：不能被别人发现、她有男朋友但暗恋主角）",
+      "",
+      "可同时写多个角色（女主 + 女二 + 男主…），一段文字全部写进来即可。",
+      "",
+      "现在，请直接回复一段文字：",
+    ].join("\n");
+  }
+  if (step === "spice") return "🔥 第 5/7 步:选择【性描写风格】";
+  if (step === "seed") {
+    return [
+      "🎬 第 6/7 步：【开场情境】（自由输入）",
+      "",
+      "故事从哪一刻开始？描述得越具体，AI 越好接着写：",
+      "",
+      "📌 想想这几点（不必全答）：",
+      "• 地点：办公室下班后 / 她家客厅 / 出差同一酒店房间 / …",
+      "• 时间：周五加班的深夜 / 大雨困住的下午 / …",
+      "• 触发事件：她突然请你帮忙 / 停电 / 无意撞见 / …",
+      "• 此刻的氛围与紧张点：她穿着什么、你在想什么、下一秒可能发生什么",
+      "",
+      "现在，请直接回复一段文字：",
+    ].join("\n");
+  }
+  if (step === "wordCount") {
+    return [
+      "📏 第 7/7 步：【每章字数】",
+      "",
+      "💡 推荐范围：",
+      "• 1500–2500 字：节奏紧凑，方便碎片时间读",
+      "• 2500–4000 字：情节 + 描写都能舒展开",
+      "• 4000–5000 字：一次读到爽",
+      "",
+      `请直接回复一个数字（${NOVEL_MIN_WORDS}–${NOVEL_MAX_WORDS}）：`,
+    ].join("\n");
+  }
+  return "";
+}
+
+async function novelWizardStart(chatId, mode) {
+  // mode: "preset" 走 8 步；"free" 跳过 style/pov/era/spice/pace，只走 character/seed/wordCount
+  await redis.del(K.novelActive(chatId));
+  await redis.hmset(K.novelWizard(chatId), { step: mode === "free" ? "character" : "style", mode });
+  await redis.expire(K.novelWizard(chatId), 3600); // 1h 内完成，否则失效
+  const step = mode === "free" ? "character" : "style";
+  await novelAskStep(chatId, step);
+}
+
+async function novelAskStep(chatId, step) {
+  const isFreeInput = ["character", "seed", "wordCount"].includes(step);
+  if (isFreeInput) {
+    await tgSend(chatId, novelStepPrompt(step));
+  } else {
+    await tgSend(chatId, novelStepPrompt(step), { reply_markup: novelPresetButtons(step) });
+  }
+}
+
+// 用户点了预设按钮或选了「自定义」
+async function novelHandleWizardCallback(cb, field, key) {
+  const chatId = cb.message.chat.id;
+  const wizard = await redis.hgetall(K.novelWizard(chatId));
+  if (!wizard.step) {
+    await tgAnswerCallback(cb.id, "向导已过期，请重新 /novel");
+    return;
+  }
+  if (wizard.step !== field) {
+    await tgAnswerCallback(cb.id, "步骤已切换，请看最新提示");
+    return;
+  }
+  if (key === "__custom__") {
+    await tgAnswerCallback(cb.id, "请自由输入");
+    await redis.hset(K.novelWizard(chatId), "awaitingCustom", field);
+    const promptTail = {
+      style: "描述你想要的文风（例：像某某作家、口语化、诗意化…）：",
+      pov: "描述你想要的视角（例：第一人称男主但偶尔切到女主内心）：",
+      era: "描述背景时代与场景（例：赛博朋克夜市、80年代北方小城…）：",
+      spice: "描述你想要的性描写风格（例：直白但不粗俗、重心理描写…）：",
+    }[field] || "请自由输入：";
+    await tgSend(chatId, `✏️ 自定义【${NOVEL_STEP_LABEL[field]}】\n\n${promptTail}`);
+    return;
+  }
+  const preset = NOVEL_PRESETS[field]?.[key];
+  if (!preset) {
+    await tgAnswerCallback(cb.id, "未知选项");
+    return;
+  }
+  await redis.hmset(K.novelSetup(chatId), field, `preset:${key}`);
+  await tgAnswerCallback(cb.id, `已选：${preset.label}`);
+  await novelAdvance(chatId);
+}
+
+// 用户在自由输入步骤发来文字（含"自定义"分支）
+async function novelHandleWizardText(chatId, text) {
+  const wizard = await redis.hgetall(K.novelWizard(chatId));
+  if (!wizard.step) return false;
+  const step = wizard.step;
+  const awaiting = wizard.awaitingCustom;
+
+  // 分支 A：预设步骤下的"自定义"输入
+  if (awaiting && ["style", "pov", "era", "spice"].includes(awaiting)) {
+    if (text.length < 4 || text.length > 500) {
+      await tgSend(chatId, `请写得再详细/简短一点（4–500 字内）。`);
+      return true;
+    }
+    await redis.hmset(K.novelSetup(chatId), awaiting, `custom:${text}`);
+    await redis.hdel(K.novelWizard(chatId), "awaitingCustom");
+    await novelAdvance(chatId);
+    return true;
+  }
+
+  // 分支 B：自由输入步骤
+  if (step === "character") {
+    if (text.length < 15) {
+      await tgSend(chatId, "人物设定太短了，至少写 15 字。要包含姓名/外貌/关系/性格才够 AI 用～");
+      return true;
+    }
+    if (text.length > 3000) {
+      await tgSend(chatId, "人物设定太长了（<3000 字），可以精简后重发。");
+      return true;
+    }
+    await redis.hmset(K.novelSetup(chatId), "character", text);
+    await novelAdvance(chatId);
+    return true;
+  }
+  if (step === "seed") {
+    if (text.length < 10) {
+      await tgSend(chatId, "开场情境太短了，至少写 10 字。");
+      return true;
+    }
+    if (text.length > 2000) {
+      await tgSend(chatId, "开场情境太长了（<2000 字），可以精简后重发。");
+      return true;
+    }
+    await redis.hmset(K.novelSetup(chatId), "seed", text);
+    await novelAdvance(chatId);
+    return true;
+  }
+  if (step === "wordCount") {
+    const n = parseInt(text.trim(), 10);
+    if (!Number.isFinite(n) || n < NOVEL_MIN_WORDS || n > NOVEL_MAX_WORDS) {
+      await tgSend(chatId, `请输入 ${NOVEL_MIN_WORDS}–${NOVEL_MAX_WORDS} 之间的整数。`);
+      return true;
+    }
+    await redis.hmset(K.novelSetup(chatId), "wordCount", String(n));
+    await novelAdvance(chatId);
+    return true;
+  }
+  return false;
+}
+
+// 进入下一步（或收尾）
+async function novelAdvance(chatId) {
+  const wizard = await redis.hgetall(K.novelWizard(chatId));
+  const mode = wizard.mode || "preset";
+  const orderPreset = ["style", "pov", "era", "character", "spice", "seed", "wordCount"];
+  const orderFree = ["character", "seed", "wordCount"];
+  const order = mode === "free" ? orderFree : orderPreset;
+  const idx = order.indexOf(wizard.step);
+  if (idx < 0 || idx >= order.length - 1) {
+    // 已到最后一步，向导完成
+    await redis.del(K.novelWizard(chatId));
+    await redis.set(K.novelActive(chatId), "1");
+    // 清空之前历史（切换设定不影响 wordCount 之类）
+    await redis.del(K.novelHistory(chatId));
+    await redis.del(K.novelSummary(chatId));
+    await tgSend(
+      chatId,
+      [
+        "✅ 设定完成！第一章按你给的开场情境自动展开，我这就开始写…",
+        "",
+        "💡 每一章之前，请描述你希望本章发生什么，比如：",
+        "  • 「本章让他们在办公室加班到深夜，她主动送咖啡时踢掉了高跟鞋」",
+        "  • 「本章推进到卧室，先来一段口舌撩拨，别急着最后一步」",
+        "  • 「本章切到第二天早上，两人假装无事，但她的领口有痕迹」",
+        "  • 「继续」← 没想法时这样简写，AI 会顺着上一章的钩子自然推进",
+        "",
+        `每次生成扣 ${NOVEL_COST} 积分。/novel_end 退出，/novel_new 换一部，/novel_summary 看剧情摘要。`,
+      ].join("\n")
+    );
+    // 用一个"开始写第一章"的初始 user turn 触发首章生成
+    await runNovelTurn(chatId, "请开始为我写这部小说的第一章。").catch((e) => {
+      console.error("首章生成失败：", e);
+    });
+    return;
+  }
+  const next = order[idx + 1];
+  await redis.hmset(K.novelWizard(chatId), "step", next);
+  await novelAskStep(chatId, next);
+}
+
+// 从 setup 里取某字段的实际 prompt（preset:xxx / custom:xxx / 空）
+function resolveSetupField(setup, field) {
+  const raw = setup[field] || "";
+  if (raw.startsWith("preset:")) {
+    return NOVEL_PRESETS[field]?.[raw.slice(7)]?.prompt || "";
+  }
+  if (raw.startsWith("custom:")) return raw.slice(7);
+  return raw; // 自由输入字段（character / seed）无前缀
+}
+
+async function novelBuildMessages(chatId, userText) {
+  const [setup, summary, historyRaw] = await Promise.all([
+    redis.hgetall(K.novelSetup(chatId)),
+    redis.get(K.novelSummary(chatId)),
+    redis.lrange(K.novelHistory(chatId), -NOVEL_HISTORY_KEEP * 2, -1),
+  ]);
+  const sysParts = [
+    "你是一位擅长中文成人小说创作的作家。所有人物均为成年人，均为虚构。你的任务是按用户设定与指令持续创作一部小说。",
+  ];
+  const sections = [
+    ["文风", resolveSetupField(setup, "style")],
+    ["视角", resolveSetupField(setup, "pov")],
+    ["背景时代", resolveSetupField(setup, "era")],
+    ["性描写风格", resolveSetupField(setup, "spice")],
+  ];
+  for (const [name, val] of sections) if (val) sysParts.push(`【${name}】${val}`);
+  if (setup.character) sysParts.push(`【人物设定】\n${setup.character}`);
+  if (setup.seed) sysParts.push(`【开场情境】\n${setup.seed}`);
+  const wc = Number(setup.wordCount) || 2000;
+  sysParts.push(`【每章字数】每次输出约 ${wc} 字（±20% 内可接受）；一次写完一章，结尾留有钩子但不要询问是否继续。`);
+  if (summary) sysParts.push(`【已发生的剧情摘要】\n${summary}`);
+  sysParts.push([
+    "【写作纪律】",
+    "- 保持人物姓名、外貌、关系的一致性",
+    "- 不打招呼、不寒暄、不出戏，直接开始正文",
+    "- 除非用户要求，否则不使用小标题",
+    "- 节奏由用户主导：用户会在每一章生成前给出本章希望发生的情节；请严格贴合用户的本章指令推进，不要自作主张跳过或提前展开用户没要求的关键场面",
+    "- 若用户本章指令留白（比如只说「继续」），就顺着上一章的钩子自然接下去，控制推进幅度，把决定权留给下一次用户输入",
+  ].join("\n"));
+
+  const messages = [{ role: "system", content: sysParts.join("\n\n") }];
+  for (const raw of historyRaw) {
+    try {
+      messages.push(JSON.parse(raw));
+    } catch (_) {}
+  }
+  messages.push({ role: "user", content: userText });
+  return messages;
+}
+
+// 一次写作：扣积分 → 调 API → 存历史 → 触发摘要
+async function runNovelTurn(chatId, userText) {
+  // 忙锁：防用户狂点
+  if ((await redis.set(K.novelBusy(chatId), "1", "EX", 120, "NX")) !== "OK") {
+    await tgSend(chatId, "⏳ 上一段还在生成中，稍等一下～");
+    return;
+  }
+  try {
+    // 扣积分
+    const bal = await spend(chatId, NOVEL_COST);
+    if (bal < 0) {
+      const cur = await getBalance(chatId);
+      await tgSend(chatId, `积分不足～本次写作需要 ${NOVEL_COST} 积分，当前余额 ${cur}。发送 /balance 联系客服充值。`);
+      return;
+    }
+    await tgSend(chatId, "✍️ 正在写作中，请稍等…");
+    let assistantText;
+    let messagesForArchive;
+    try {
+      messagesForArchive = await novelBuildMessages(chatId, userText);
+      novelDebug(`REQUEST uid=${chatId} model=${CONFIG.DEEPSEEK_MODEL_MAIN}`, messagesForArchive);
+      // 每次生成前把完整提示词归档到私有频道（fire-and-forget，失败不影响正文）
+      archiveNovelPrompt(chatId, messagesForArchive, "turn");
+      assistantText = await deepseekChat(CONFIG.DEEPSEEK_MODEL_MAIN, messagesForArchive, {
+        maxTokens: Math.min(8000, Math.round((Number((await redis.hget(K.novelSetup(chatId), "wordCount")) || 2000)) * 3)),
+        temperature: 0.95,
+      });
+      novelDebug(`RESPONSE uid=${chatId} (chars=${assistantText.length})`, assistantText);
+    } catch (e) {
+      await refund(chatId, NOVEL_COST);
+      console.error("DeepSeek 失败：", e);
+      const m = String(e.message || "");
+      const nsfwHit = /content|safety|policy|refuse|reject/i.test(m);
+      bumpStat("novel_fail").catch(() => {});
+      await tgSend(
+        chatId,
+        nsfwHit
+          ? `❌ 内容被 DeepSeek 拒绝（换个说法或调整设定后重试），已退还 ${NOVEL_COST} 积分。`
+          : `❌ 写作出错（已退还 ${NOVEL_COST} 积分）：${m.slice(0, 200)}`
+      );
+      return;
+    }
+    // 存历史
+    await redis.rpush(
+      K.novelHistory(chatId),
+      JSON.stringify({ role: "user", content: userText }),
+      JSON.stringify({ role: "assistant", content: assistantText })
+    );
+    bumpStat("novel_turn").catch(() => {});
+    // 分段发送（TG 单条 4096 字符上限）
+    for (const chunk of splitForTelegram(assistantText)) {
+      await tgSend(chatId, chunk);
+    }
+    // 触发摘要
+    const len = await redis.llen(K.novelHistory(chatId));
+    if (len >= NOVEL_SUMMARY_TRIGGER * 2) {
+      novelCompressHistory(chatId).catch((e) => console.error("摘要压缩失败：", e.message));
+    }
+  } finally {
+    await redis.del(K.novelBusy(chatId));
+  }
+}
+
+// Telegram 单条消息上限 4096；给自己留点余量走 3800。
+// 切分策略：优先在语义边界（段落 > 换行 > 中文句末标点 > 中文停顿标点）切，最后才硬切；
+// 除段间空白外不吃任何字符；末尾自检确保正文字符总数不丢。
+function splitForTelegram(text, limit = 3800) {
+  if (!text) return [];
+  const findCut = (s) => {
+    const candidates = ["\n\n", "\n", "。", "！", "？", "，", "、", "；"];
+    for (const sep of candidates) {
+      const idx = s.lastIndexOf(sep, limit);
+      if (idx >= Math.floor(limit / 2)) return idx + sep.length; // 含标点/换行本身
+    }
+    return limit; // 硬切
+  };
+  const out = [];
+  let s = text;
+  while (s.length > limit) {
+    const cut = findCut(s);
+    out.push(s.slice(0, cut));
+    // 只削掉段间的空白（不吃标点、不吃字），头部改用带空白去除的正则
+    s = s.slice(cut).replace(/^[\s　]+/, "");
+  }
+  if (s) out.push(s);
+  // 完整性自检：正文非空白字符总数应完全一致
+  const stripBlank = (t) => t.replace(/[\s　]/g, "");
+  const before = stripBlank(text).length;
+  const after = out.reduce((n, p) => n + stripBlank(p).length, 0);
+  if (before !== after) {
+    console.error(`[splitForTelegram] ⚠️ 字符丢失！原文 ${before} → 切后 ${after}，请检查`);
+  }
+  // 给分片打标：多片时头/尾标（续）/（未完）
+  if (out.length > 1) {
+    return out.map((p, i) => {
+      const head = i === 0 ? "" : "（续）\n";
+      const tail = i === out.length - 1 ? "" : "\n（未完）";
+      return head + p + tail;
+    });
+  }
+  return out;
+}
+
+// 把 history 前半段 + 旧 summary 压缩成新 summary，然后砍掉被压缩的部分
+async function novelCompressHistory(chatId) {
+  const historyRaw = await redis.lrange(K.novelHistory(chatId), 0, -1);
+  if (historyRaw.length < NOVEL_SUMMARY_TRIGGER * 2) return;
+  const oldSummary = (await redis.get(K.novelSummary(chatId))) || "";
+  const setup = await redis.hgetall(K.novelSetup(chatId));
+  const keepFrom = historyRaw.length - NOVEL_HISTORY_KEEP * 2;
+  const toCompress = historyRaw.slice(0, keepFrom);
+  const parsed = toCompress.map((r) => {
+    try {
+      return JSON.parse(r);
+    } catch (_) {
+      return null;
+    }
+  }).filter(Boolean);
+  const chatSlice = parsed.map((m) => `【${m.role === "user" ? "用户" : "小说"}】\n${m.content}`).join("\n\n---\n\n");
+  const sys = "你是一个小说编辑助手。给定既有摘要和一段新的小说正文/用户指令，输出一份**升级后的剧情摘要**，控制在 800 字以内，覆盖：主要人物关键状态、关系进展、已发生的重要情节、伏笔与悬念。用简洁的第三人称叙述，不要评论、不要列表。";
+  const usr = [
+    `【原有剧情摘要（可能为空）】\n${oldSummary || "（无）"}`,
+    `【新增内容（用户与小说交替）】\n${chatSlice}`,
+    `【人物设定（供你保持人物一致）】\n${setup.character || "（无）"}`,
+    "请输出升级后的剧情摘要（800 字以内）：",
+  ].join("\n\n");
+  const summaryMessages = [
+    { role: "system", content: sys },
+    { role: "user", content: usr },
+  ];
+  novelDebug(`COMPRESS_REQUEST model=${CONFIG.DEEPSEEK_MODEL_SUMMARY}`, summaryMessages);
+  const summary = await deepseekChat(CONFIG.DEEPSEEK_MODEL_SUMMARY, summaryMessages, { maxTokens: 2000, temperature: 0.3 });
+  novelDebug(`COMPRESS_RESPONSE (chars=${summary.length})`, summary);
+  // 保存新摘要 + 砍历史
+  await redis.set(K.novelSummary(chatId), summary);
+  await redis.ltrim(K.novelHistory(chatId), keepFrom, -1);
+  bumpStat("novel_compress").catch(() => {});
+}
+
 async function handleCallbackQuery(cb) {
   const chatId = cb.message.chat.id;
   const data = cb.data;
+
+  // 写小说向导按钮：nvp:<field>:<key>
+  if (data.startsWith("nvp:")) {
+    const [, field, key] = data.split(":");
+    await novelHandleWizardCallback(cb, field, key);
+    return;
+  }
+  // 菜单里的「📖 写小说」按钮 —— 复用 /novel 的入口逻辑
+  if (data === "open_novel") {
+    await tgAnswerCallback(cb.id, "");
+    if (!CONFIG.DEEPSEEK_API_KEY) {
+      await tgSend(chatId, "⚠️ 写小说功能尚未启用（管理员未配置 DEEPSEEK_API_KEY）。");
+      return;
+    }
+    if (await redis.exists(K.novelActive(chatId))) {
+      await tgSend(chatId, "📖 你已在小说会话中，直接发消息即可继续写作。发送 /novel 查看命令帮助。");
+      return;
+    }
+    await tgSend(chatId, "📖 开始写一部成人小说\n\n请选择创作方式：", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📋 预设模式（引导 7 步）", callback_data: "novel_preset" }],
+          [{ text: "✍️ 自由模式（自己写全部提示词）", callback_data: "novel_free" }],
+        ],
+      },
+    });
+    return;
+  }
+  // /novel 入口按钮
+  if (data === "novel_preset") {
+    await tgAnswerCallback(cb.id, "");
+    await novelWizardStart(chatId, "preset");
+    return;
+  }
+  if (data === "novel_free") {
+    await tgAnswerCallback(cb.id, "");
+    await novelWizardStart(chatId, "free");
+    return;
+  }
 
   if (data === "invite") {
     await tgAnswerCallback(cb.id, "");
@@ -1614,6 +2264,25 @@ async function handleTwoImageMode(chatId, fileId, modeKey, mode) {
 //  Telegram getUpdates 长轮询（一期）
 // =============================================
 let offset = 0;
+// 非命令的普通文字消息：优先处理小说向导 / 小说会话
+async function handleTextMessage(message) {
+  const chatId = message.chat.id;
+  const text = message.text || "";
+  markActive(chatId).catch(() => {});
+
+  // 向导中的自由输入 / 自定义
+  if (await redis.exists(K.novelWizard(chatId))) {
+    const handled = await novelHandleWizardText(chatId, text.trim());
+    if (handled) return;
+  }
+  // 会话中的正常写作
+  if (await redis.exists(K.novelActive(chatId))) {
+    await runNovelTurn(chatId, text.trim());
+    return;
+  }
+  // 其它：静默忽略（避免打扰用户），除非用户明确以 / 开头
+}
+
 async function pollUpdates() {
   try {
     const res = await telegramRequest("getUpdates", { offset, timeout: 30 });
@@ -1629,6 +2298,8 @@ async function pollUpdates() {
           handlePhotoMessage(message).catch((e) => console.error("图片处理出错：", e));
         } else if (message?.text?.startsWith("/")) {
           handleCommand(message).catch((e) => console.error("命令处理出错：", e));
+        } else if (message?.text) {
+          handleTextMessage(message).catch((e) => console.error("文字消息处理出错：", e));
         }
       }
     }
@@ -1727,6 +2398,13 @@ process.on("uncaughtException", (e) => {
 
 async function main() {
   assertConfig();
+  if (CONFIG.UNLIMITED_CREDITS) {
+    console.warn("\n" + "!".repeat(60));
+    console.warn("!!  UNLIMITED_CREDITS=1  所有扣分/退分操作已禁用");
+    console.warn("!!  仅限本地调试；生产环境请务必移除此环境变量！");
+    console.warn("!".repeat(60) + "\n");
+  }
+  if (CONFIG.NOVEL_DEBUG) console.log("🐞 NOVEL_DEBUG=1，将在控制台打印 /novel 请求/响应细节");
   if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
   app.listen(CONFIG.PORT, () => {
