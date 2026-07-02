@@ -34,15 +34,23 @@ const BOT_USERNAME = (process.env.BOT_USERNAME || "@ai_ym_lyf_bot").replace(/^@/
 const START_PARAM = process.env.START_PARAM || "";
 const BUTTON_TEXT = process.env.BUTTON_TEXT || "🤖 进入机器人";
 const DEFAULT_MESSAGE = process.env.MESSAGE_TEXT ||
-  ` 新增 全能模式！ 你的暗恋对象、女老师、女领导、女同事，
-    只要输入提示词，你可以让她们摆出各种骚样！
-    点下方按钮直接私聊机器人
+  `TG机器人小说模式上线！把女神变成你的专属女人正文：你的TG机器人全新小说模式来了！  想让杨幂、迪丽热巴、杨颖、网红、以及你的任意女神彻底属于你吗？
+输入名字 + 剧情需求，就能生成完整小说。  支持多种风格：  甜宠、霸总  
+纯爱、NTR  
+母猪调教（极致堕落）  
+其他任意玩法
+
+从温柔占有到彻底把她调教成发情母猪，随你选择。
+让现实中的女神，在你的故事里跪下、臣服、变成只属于你的性奴。  快来试试吧，输入任意女神名字开启你的专属小说～
+示例：
+杨幂跪在地上，肥美的屁股高高拱起，骚穴正被你狠狠撞击。
+「主人♡ 幂奴是您的骚母猪♡」她翻着白眼，口水直流，哭着扭腰猛摇，「求求您……把幂奴的子宫操坏吧♡ 让幂奴彻底变成只会喷水的肉便器母猪啊啊啊♡♡♡！」
     🎁 新人立刻送 2 积分，今晚就能爽到了～
 `;
 
 const args = process.argv.slice(2);
 const messageText = args[0] || DEFAULT_MESSAGE;
-const image = args[1] || process.env.IMAGE || "./3.jpg";
+const image = args[1] || process.env.IMAGE || "./3.png";
 
 function assertConfig() {
   const missing = [];

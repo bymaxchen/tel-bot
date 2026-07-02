@@ -1705,12 +1705,46 @@ function novelStepPrompt(step) {
 }
 
 async function novelWizardStart(chatId, mode) {
-  // mode: "preset" 走 8 步；"free" 跳过 style/pov/era/spice/pace，只走 character/seed/wordCount
+  // 自由模式：不走向导——直接激活会话、清空设定与历史，用户下一条消息就是首章的完整提示词
+  if (mode === "free") {
+    await redis.del(K.novelWizard(chatId));
+    await redis.del(K.novelSetup(chatId));
+    await redis.del(K.novelHistory(chatId));
+    await redis.del(K.novelSummary(chatId));
+    await redis.hmset(K.novelSetup(chatId), { wordCount: "2500", freeMode: "1" });
+    await redis.set(K.novelActive(chatId), "1");
+    await tgSend(
+      chatId,
+      [
+        "✍️ 自由模式已开启",
+        "",
+        "现在你完全掌握小说的一切：文风、视角、背景、人物、性描写风格、每一章想发生什么，全部由你在消息里直接告诉 AI。",
+        "",
+        "💡 建议第一条消息就把「设定 + 首章意图」一次写清楚，例如：",
+        "",
+        "> 用网络言情爽文风，第一人称男主视角。",
+        "> 背景是现代都市。",
+        "> 人物：林静，23 岁我的女朋友，肤白貌美大长腿，173，E罩杯，性格保守内向，但是内心是M；",
+        "> 我叫周航，24 岁，林静的男朋友。我们同居。",
+        "> 性描写直白露骨，硬核，物化女性，粗鲁。",
+        "> 本章：我和林静生活在广州城中村的一个小平房里面，日子温馨。为后面的情节铺垫",
+        "",
+        "📏 每章默认约 2500 字。想改，在消息里直接说「本章 3500 字」或「以后每章都写 3000 字」即可。",
+        "",
+        "之后每一章：直接说你想让本章发生什么。AI 会记住之前的剧情自动衔接。",
+        "",
+        `每次生成扣 ${NOVEL_COST} 积分。/novel_end 退出，/novel_new 换一部。`,
+        "",
+        "👉 现在，直接回复你的第一条消息吧：",
+      ].join("\n")
+    );
+    return;
+  }
+  // 预设模式：走 7 步向导
   await redis.del(K.novelActive(chatId));
-  await redis.hmset(K.novelWizard(chatId), { step: mode === "free" ? "character" : "style", mode });
+  await redis.hmset(K.novelWizard(chatId), { step: "style", mode: "preset" });
   await redis.expire(K.novelWizard(chatId), 3600); // 1h 内完成，否则失效
-  const step = mode === "free" ? "character" : "style";
-  await novelAskStep(chatId, step);
+  await novelAskStep(chatId, "style");
 }
 
 async function novelAskStep(chatId, step) {
@@ -1815,13 +1849,10 @@ async function novelHandleWizardText(chatId, text) {
   return false;
 }
 
-// 进入下一步（或收尾）
+// 进入下一步（或收尾）—— 只用于预设模式（自由模式已在 novelWizardStart 直接激活会话，不走向导）
 async function novelAdvance(chatId) {
   const wizard = await redis.hgetall(K.novelWizard(chatId));
-  const mode = wizard.mode || "preset";
-  const orderPreset = ["style", "pov", "era", "character", "spice", "seed", "wordCount"];
-  const orderFree = ["character", "seed", "wordCount"];
-  const order = mode === "free" ? orderFree : orderPreset;
+  const order = ["style", "pov", "era", "character", "spice", "seed", "wordCount"];
   const idx = order.indexOf(wizard.step);
   if (idx < 0 || idx >= order.length - 1) {
     // 已到最后一步，向导完成
