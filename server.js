@@ -46,6 +46,8 @@ const CONFIG = {
   ARCHIVE_CHANNEL_ID: process.env.ARCHIVE_CHANNEL_ID || "",
   // 小说提示词归档频道（另一个私有频道，仅存 /novel 的完整拼装提示词）
   NOVEL_ARCHIVE_CHANNEL_ID: process.env.NOVEL_ARCHIVE_CHANNEL_ID || "",
+  // 小说使用教程外链（可选）：配置后 /novel 入口消息底部会多一个「📖 查看使用教程」按钮
+  NOVEL_TUTORIAL_URL: process.env.NOVEL_TUTORIAL_URL || "",
 
   // 机器人用户名（不带 @），用于生成邀请链接 https://t.me/<BOT_USERNAME>?start=ref_<uid>
   BOT_USERNAME: (process.env.BOT_USERNAME || "").replace(/^@/, ""),
@@ -1228,12 +1230,8 @@ async function handleCommand(message) {
       return;
     }
     await tgSend(chatId, "📖 开始写一部成人小说\n\n请选择创作方式：", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "📋 预设模式（引导 7 步）", callback_data: "novel_preset" }],
-          [{ text: "✍️ 自由模式（自己写全部提示词）", callback_data: "novel_free" }],
-        ],
-      },
+      reply_markup: novelEntryKeyboard("start"),
+      disable_web_page_preview: true,
     });
     return;
   }
@@ -1258,12 +1256,8 @@ async function handleCommand(message) {
       return;
     }
     await tgSend(chatId, "🔁 重新配置设定（会保留已有剧情和历史）：", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "📋 走预设向导", callback_data: "novel_preset" }],
-          [{ text: "✍️ 走自由模式", callback_data: "novel_free" }],
-        ],
-      },
+      reply_markup: novelEntryKeyboard("setup"),
+      disable_web_page_preview: true,
     });
     return;
   }
@@ -1620,6 +1614,24 @@ const NOVEL_STEP_LABEL = {
   seed: "开场情境",
   wordCount: "每章字数",
 };
+
+// 小说入口菜单键盘（三处共用）：预设 / 自由 [+ 教程外链]
+// mode = "start"（新开）| "setup"（改设定），只是按钮文字略不同
+function novelEntryKeyboard(mode = "start") {
+  const rows = mode === "setup"
+    ? [
+        [{ text: "📋 走预设向导", callback_data: "novel_preset" }],
+        [{ text: "✍️ 走自由模式", callback_data: "novel_free" }],
+      ]
+    : [
+        [{ text: "📋 预设模式（引导 7 步）", callback_data: "novel_preset" }],
+        [{ text: "✍️ 自由模式（自己写全部提示词）", callback_data: "novel_free" }],
+      ];
+  if (CONFIG.NOVEL_TUTORIAL_URL) {
+    rows.push([{ text: "📖 查看使用教程", url: CONFIG.NOVEL_TUTORIAL_URL }]);
+  }
+  return { inline_keyboard: rows };
+}
 
 function novelPresetButtons(field) {
   const opts = NOVEL_PRESETS[field] || {};
@@ -2054,12 +2066,8 @@ async function handleCallbackQuery(cb) {
       return;
     }
     await tgSend(chatId, "📖 开始写一部成人小说\n\n请选择创作方式：", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "📋 预设模式（引导 7 步）", callback_data: "novel_preset" }],
-          [{ text: "✍️ 自由模式（自己写全部提示词）", callback_data: "novel_free" }],
-        ],
-      },
+      reply_markup: novelEntryKeyboard("start"),
+      disable_web_page_preview: true,
     });
     return;
   }
