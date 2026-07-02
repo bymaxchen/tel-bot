@@ -1255,7 +1255,16 @@ async function handleCommand(message) {
       );
       return;
     }
-    await tgSend(chatId, "📖 开始写一部成人小说\n\n请选择创作方式：", {
+    await tgSend(chatId, [
+      "📖 开始写一部成人小说",
+      "",
+      "💡 强烈建议：一章一章写。",
+      "每一章之前，只描述本章想要发生的情节（比如「本章推进到卧室，先来一段口舌撩拨」），",
+      "让 AI 专注写好这一小段。这样节奏可控、细节更丰满、你能实时调整走向；",
+      "一次让 AI 展开一大段故事，往往越到后面越糊、人物容易走形。",
+      "",
+      "请选择创作方式：",
+    ].join("\n"), {
       reply_markup: novelEntryKeyboard("start"),
       disable_web_page_preview: true,
     });
@@ -2017,6 +2026,19 @@ async function runNovelTurn(chatId, userText) {
     for (const chunk of splitForTelegram(assistantText)) {
       await tgSend(chatId, chunk);
     }
+    // 引导：不满意可以直接改这一章
+    await tgSend(
+      chatId,
+      [
+        "━━━━━━━━━━━━━━",
+        "💡 不满意本章？直接发文字告诉我怎么改，比如：",
+        "  • 「重写本章，让她再主动一点」",
+        "  • 「结尾改得更暧昧、留更强的钩子」",
+        "  • 「把第二段扩写成 500 字，加更多身体反应描写」",
+        "",
+        "满意的话，直接发下一章想发生什么即可继续。",
+      ].join("\n")
+    );
     // 触发摘要
     const len = await redis.llen(K.novelHistory(chatId));
     if (len >= NOVEL_SUMMARY_TRIGGER * 2) {
@@ -2124,7 +2146,16 @@ async function handleCallbackQuery(cb) {
       await tgSend(chatId, "📖 你已在小说会话中，直接发消息即可继续写作。发送 /novel 查看命令帮助。");
       return;
     }
-    await tgSend(chatId, "📖 开始写一部成人小说\n\n请选择创作方式：", {
+    await tgSend(chatId, [
+      "📖 开始写一部成人小说",
+      "",
+      "💡 强烈建议：一章一章写。",
+      "每一章之前，只描述本章想要发生的情节（比如「本章推进到卧室，先来一段口舌撩拨」），",
+      "让 AI 专注写好这一小段。这样节奏可控、细节更丰满、你能实时调整走向；",
+      "一次让 AI 展开一大段故事，往往越到后面越糊、人物容易走形。",
+      "",
+      "请选择创作方式：",
+    ].join("\n"), {
       reply_markup: novelEntryKeyboard("start"),
       disable_web_page_preview: true,
     });
