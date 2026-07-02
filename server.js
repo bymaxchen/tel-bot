@@ -538,10 +538,36 @@ function archiveNovelPrompt(chatId, messages, tag = "") {
   return tgSendDocument(
     CONFIG.NOVEL_ARCHIVE_CHANNEL_ID,
     buf,
-    `novel_${chatId}_${ts}.txt`,
-    `[novel] uid=${chatId} ${tag}`,
+    `novel_prompt_${chatId}_${ts}.txt`,
+    `[novel-prompt] uid=${chatId} ${tag}`,
     "text/plain; charset=utf-8"
-  ).catch((e) => console.error("小说归档失败：", e.message));
+  ).catch((e) => console.error("小说提示词归档失败：", e.message));
+}
+
+// 归档小说的一次输出到私有频道（用户本轮 input + AI 本轮 output）
+function archiveNovelOutput(chatId, userText, output) {
+  if (!CONFIG.NOVEL_ARCHIVE_CHANNEL_ID) return Promise.resolve();
+  const lines = [
+    "===== NOVEL OUTPUT =====",
+    `uid=${chatId}`,
+    `time=${new Date().toISOString()}`,
+    `input_len=${(userText || "").length}  output_len=${(output || "").length}`,
+    "",
+    "----- 用户本轮指令 -----",
+    userText || "",
+    "",
+    "----- AI 生成正文 -----",
+    output || "",
+  ];
+  const buf = Buffer.from(lines.join("\n"), "utf8");
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  return tgSendDocument(
+    CONFIG.NOVEL_ARCHIVE_CHANNEL_ID,
+    buf,
+    `novel_output_${chatId}_${ts}.txt`,
+    `[novel-output] uid=${chatId} chars=${(output || "").length}`,
+    "text/plain; charset=utf-8"
+  ).catch((e) => console.error("小说输出归档失败：", e.message));
 }
 
 // =============================================
@@ -1978,6 +2004,8 @@ async function runNovelTurn(chatId, userText) {
       );
       return;
     }
+    // 归档本轮 input + AI output 到私有频道（fire-and-forget）
+    archiveNovelOutput(chatId, userText, assistantText);
     // 存历史
     await redis.rpush(
       K.novelHistory(chatId),
